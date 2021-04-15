@@ -9,7 +9,7 @@ use crate::storage::txn::{Error as TxnError, ErrorInner as TxnErrorInner};
 use crate::storage::{
     Error as StorageError, ErrorInner as StorageErrorInner, ProcessResult, StorageCallback,
 };
-use tikv_util::collections::HashMap;
+use collections::HashMap;
 use tikv_util::worker::{FutureRunnable, FutureScheduler, Stopped};
 
 use std::cell::RefCell;
@@ -22,10 +22,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use futures03::compat::Compat01As03;
-use futures03::compat::Future01CompatExt;
-use futures03::future::Future;
-use futures03::task::{Context, Poll};
+use futures::compat::Compat01As03;
+use futures::compat::Future01CompatExt;
+use futures::future::Future;
+use futures::task::{Context, Poll};
 use kvproto::deadlock::WaitForEntry;
 use prometheus::HistogramTimer;
 use tikv_util::config::ReadableDuration;
@@ -611,8 +611,8 @@ pub mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use futures03::executor::block_on;
-    use futures03::future::FutureExt;
+    use futures::executor::block_on;
+    use futures::future::FutureExt;
     use kvproto::kvrpcpb::LockInfo;
     use rand::prelude::*;
     use tikv_util::config::ReadableDuration;
@@ -691,7 +691,7 @@ pub mod tests {
     pub(crate) type WaiterCtx = (
         Waiter,
         LockInfo,
-        futures03::channel::oneshot::Receiver<
+        futures::channel::oneshot::Receiver<
             Result<Result<PessimisticLockRes, StorageError>, StorageError>,
         >,
     );
@@ -851,7 +851,7 @@ pub mod tests {
     #[test]
     fn test_waiter_on_timeout() {
         // The timeout handler should be invoked after timeout.
-        let (waiter, _, _) = new_test_waiter(10.into(), 20.into(), 20);
+        let (waiter, ..) = new_test_waiter(10.into(), 20.into(), 20);
         waiter.reset_timeout(Instant::now() + Duration::from_millis(100));
         let (tx, rx) = mpsc::sync_channel(1);
         let f = waiter.on_timeout(move || tx.send(1).unwrap());
@@ -859,7 +859,7 @@ pub mod tests {
         rx.try_recv().unwrap();
 
         // The timeout handler shouldn't be invoked after waiter has been notified.
-        let (waiter, _, _) = new_test_waiter(10.into(), 20.into(), 20);
+        let (waiter, ..) = new_test_waiter(10.into(), 20.into(), 20);
         waiter.reset_timeout(Instant::now() + Duration::from_millis(100));
         let (tx, rx) = mpsc::sync_channel(1);
         let f = waiter.on_timeout(move || tx.send(1).unwrap());
@@ -896,15 +896,17 @@ pub mod tests {
         }
         assert_eq!(wait_table.count(), 0);
         assert!(wait_table.wait_table.is_empty());
-        assert!(wait_table
-            .remove_waiter(
-                Lock {
-                    ts: TimeStamp::zero(),
-                    hash: 0
-                },
-                TimeStamp::zero(),
-            )
-            .is_none());
+        assert!(
+            wait_table
+                .remove_waiter(
+                    Lock {
+                        ts: TimeStamp::zero(),
+                        hash: 0
+                    },
+                    TimeStamp::zero(),
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -915,9 +917,11 @@ pub mod tests {
             ts: 20.into(),
             hash: 20,
         };
-        assert!(wait_table
-            .add_waiter(dummy_waiter(waiter_ts, lock.ts, lock.hash))
-            .is_none());
+        assert!(
+            wait_table
+                .add_waiter(dummy_waiter(waiter_ts, lock.ts, lock.hash))
+                .is_none()
+        );
         let waiter = wait_table
             .add_waiter(dummy_waiter(waiter_ts, lock.ts, lock.hash))
             .unwrap();
@@ -1021,9 +1025,11 @@ pub mod tests {
         let detect_worker = FutureWorker::new("dummy-deadlock");
         let detector_scheduler = DetectorScheduler::new(detect_worker.scheduler());
 
-        let mut cfg = Config::default();
-        cfg.wait_for_lock_timeout = ReadableDuration::millis(wait_for_lock_timeout);
-        cfg.wake_up_delay_duration = ReadableDuration::millis(wake_up_delay_duration);
+        let cfg = Config {
+            wait_for_lock_timeout: ReadableDuration::millis(wait_for_lock_timeout),
+            wake_up_delay_duration: ReadableDuration::millis(wake_up_delay_duration),
+            ..Default::default()
+        };
         let mut waiter_mgr_worker = FutureWorker::new("test-waiter-manager");
         let waiter_mgr_runner =
             WaiterManager::new(Arc::new(AtomicUsize::new(0)), detector_scheduler, &cfg);
@@ -1136,7 +1142,7 @@ pub mod tests {
             );
             waiters_info.push((waiter_ts, lock_info, f));
         }
-        waiters_info.sort_by_key(|(ts, _, _)| *ts);
+        waiters_info.sort_by_key(|(ts, ..)| *ts);
         let mut commit_ts = 30.into();
         // Each waiter should be waked up immediately in order.
         for (waiter_ts, mut lock_info, f) in waiters_info.drain(..waiters_info.len() - 1) {
@@ -1298,7 +1304,7 @@ pub mod tests {
             .add_waiter(dummy_waiter(10.into(), 20.into(), 10000));
         let hashes: Vec<u64> = (0..1000).collect();
         b.iter(|| {
-            test::black_box(|| waiter_mgr.handle_wake_up(20.into(), hashes.clone(), 30.into()));
+            waiter_mgr.handle_wake_up(20.into(), hashes.clone(), 30.into());
         });
     }
 }

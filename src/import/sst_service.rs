@@ -1,14 +1,15 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::f64::INFINITY;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
-use engine_traits::{name_to_cf, CompactExt, MiscExt, CF_DEFAULT, CF_WRITE};
-use futures::Future;
-use futures03::compat::{Compat, Future01CompatExt, Stream01CompatExt};
-use futures03::executor::{ThreadPool, ThreadPoolBuilder};
-use futures03::future::FutureExt;
-use futures03::stream::TryStreamExt;
+use collections::HashSet;
+
+use engine_traits::{name_to_cf, KvEngine, CF_DEFAULT};
+use file_system::{set_io_type, IOType};
+use futures::executor::{ThreadPool, ThreadPoolBuilder};
+use futures::{TryFutureExt, TryStreamExt};
 use grpcio::{ClientStreamingSink, RequestStream, RpcContext, UnarySink};
 use kvproto::errorpb;
 
@@ -21,11 +22,9 @@ use kvproto::import_sstpb::*;
 use kvproto::raft_cmdpb::*;
 
 use crate::server::CONFIG_ROCKSDB_GAUGE;
-use engine_rocks::RocksEngine;
 use engine_traits::{SstExt, SstWriterBuilder};
-use raftstore::router::RaftStoreRouter;
-use raftstore::store::Callback;
-use security::{check_common_name, SecurityManager};
+use raftstore::router::handle_send_error;
+use raftstore::store::{Callback, ProposalRouter, RaftCommand};
 use sst_importer::send_rpc_response;
 use tikv_util::future::create_stream_with_buffer;
 use tikv_util::future::paired_future_callback;
@@ -34,63 +33,84 @@ use tikv_util::time::{Instant, Limiter};
 use sst_importer::import_mode::*;
 use sst_importer::metrics::*;
 use sst_importer::service::*;
-use sst_importer::{error_inc, Config, Error, SSTImporter};
+use sst_importer::{error_inc, sst_meta_to_path, Config, Error, Result, SSTImporter};
 
 /// ImportSSTService provides tikv-server with the ability to ingest SST files.
 ///
 /// It saves the SST sent from client to a file and then sends a command to
 /// raftstore to trigger the ingest process.
 #[derive(Clone)]
-pub struct ImportSSTService<Router> {
+pub struct ImportSSTService<E, Router>
+where
+    E: KvEngine,
+{
     cfg: Config,
+    engine: E,
     router: Router,
-    engine: RocksEngine,
     threads: ThreadPool,
     importer: Arc<SSTImporter>,
-    switcher: ImportModeSwitcher<RocksEngine>,
+    switcher: ImportModeSwitcher<E>,
     limiter: Limiter,
-    security_mgr: Arc<SecurityManager>,
+    task_slots: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
-impl<Router: RaftStoreRouter<RocksEngine>> ImportSSTService<Router> {
+impl<E, Router> ImportSSTService<E, Router>
+where
+    E: KvEngine,
+    Router: ProposalRouter<E::Snapshot> + Clone,
+{
     pub fn new(
         cfg: Config,
         router: Router,
-        engine: RocksEngine,
+        engine: E,
         importer: Arc<SSTImporter>,
-        security_mgr: Arc<SecurityManager>,
-    ) -> ImportSSTService<Router> {
+    ) -> ImportSSTService<E, Router> {
         let threads = ThreadPoolBuilder::new()
             .pool_size(cfg.num_threads)
             .name_prefix("sst-importer")
-            .after_start(move |_| tikv_alloc::add_thread_memory_accessor())
+            .after_start(move |_| {
+                tikv_alloc::add_thread_memory_accessor();
+                set_io_type(IOType::Import);
+            })
             .before_stop(move |_| tikv_alloc::remove_thread_memory_accessor())
             .create()
             .unwrap();
         let switcher = ImportModeSwitcher::new(&cfg, &threads, engine.clone());
         ImportSSTService {
             cfg,
-            router,
             engine,
             threads,
+            router,
             importer,
             switcher,
             limiter: Limiter::new(INFINITY),
-            security_mgr,
+            task_slots: Arc::new(Mutex::new(HashSet::default())),
         }
+    }
+
+    fn acquire_lock(task_slots: &Arc<Mutex<HashSet<PathBuf>>>, meta: &SstMeta) -> Result<bool> {
+        let mut slots = task_slots.lock().unwrap();
+        let p = sst_meta_to_path(meta)?;
+        Ok(slots.insert(p))
+    }
+    fn release_lock(task_slots: &Arc<Mutex<HashSet<PathBuf>>>, meta: &SstMeta) -> Result<bool> {
+        let mut slots = task_slots.lock().unwrap();
+        let p = sst_meta_to_path(meta)?;
+        Ok(slots.remove(&p))
     }
 }
 
-impl<Router: RaftStoreRouter<RocksEngine>> ImportSst for ImportSSTService<Router> {
+impl<E, Router> ImportSst for ImportSSTService<E, Router>
+where
+    E: KvEngine,
+    Router: 'static + ProposalRouter<E::Snapshot> + Clone + Send,
+{
     fn switch_mode(
         &mut self,
         ctx: RpcContext<'_>,
         req: SwitchModeRequest,
         sink: UnarySink<SwitchModeResponse>,
     ) {
-        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
-            return;
-        }
         let label = "switch_mode";
         let timer = Instant::now_coarse();
 
@@ -106,31 +126,27 @@ impl<Router: RaftStoreRouter<RocksEngine>> ImportSst for ImportSSTService<Router
         };
         match res {
             Ok(_) => info!("switch mode"; "mode" => ?req.get_mode()),
-            Err(ref e) => error!(%e; "switch mode failed"; "mode" => ?req.get_mode(),),
+            Err(ref e) => error!(%*e; "switch mode failed"; "mode" => ?req.get_mode(),),
         }
 
         let task = async move {
             let res = Ok(SwitchModeResponse::default());
             send_rpc_response!(res, sink, label, timer);
         };
-        ctx.spawn(Compat::new(task.unit_error().boxed()));
+        ctx.spawn(task);
     }
 
     /// Receive SST from client and save the file for later ingesting.
     fn upload(
         &mut self,
-        ctx: RpcContext<'_>,
+        _ctx: RpcContext<'_>,
         stream: RequestStream<UploadRequest>,
         sink: ClientStreamingSink<UploadResponse>,
     ) {
-        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
-            return;
-        }
         let label = "upload";
         let timer = Instant::now_coarse();
         let import = self.importer.clone();
-        let (rx, buf_driver) =
-            create_stream_with_buffer(stream.compat(), self.cfg.stream_channel_window);
+        let (rx, buf_driver) = create_stream_with_buffer(stream, self.cfg.stream_channel_window);
         let mut rx = rx.map_err(Error::from);
 
         let handle_task = async move {
@@ -160,40 +176,44 @@ impl<Router: RaftStoreRouter<RocksEngine>> ImportSst for ImportSSTService<Router
             send_rpc_response!(res, sink, label, timer);
         };
 
-        let thread_handle = self.threads.clone();
-        let ctx_task = async move {
-            thread_handle.spawn_ok(buf_driver);
-            thread_handle.spawn_ok(handle_task);
-        };
-        ctx.spawn(Compat::new(ctx_task.unit_error().boxed()));
+        self.threads.spawn_ok(buf_driver);
+        self.threads.spawn_ok(handle_task);
     }
 
     /// Downloads the file and performs key-rewrite for later ingesting.
     fn download(
         &mut self,
-        ctx: RpcContext<'_>,
+        _ctx: RpcContext<'_>,
         req: DownloadRequest,
         sink: UnarySink<DownloadResponse>,
     ) {
-        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
-            return;
-        }
         let label = "download";
         let timer = Instant::now_coarse();
         let importer = Arc::clone(&self.importer);
         let limiter = self.limiter.clone();
-        let sst_writer = <RocksEngine as SstExt>::SstWriterBuilder::new()
-            .set_db(&self.engine)
-            .set_cf(name_to_cf(req.get_sst().get_cf_name()).unwrap())
-            .build(self.importer.get_path(req.get_sst()).to_str().unwrap())
-            .unwrap();
+        let engine = self.engine.clone();
+        let start = Instant::now();
 
         let handle_task = async move {
+            // Records how long the download task waits to be scheduled.
+            sst_importer::metrics::IMPORTER_DOWNLOAD_DURATION
+                .with_label_values(&["queue"])
+                .observe(start.elapsed().as_secs_f64());
+
+            // SST writer must not be opened in gRPC threads, because it may be
+            // blocked for a long time due to IO, especially, when encryption at rest
+            // is enabled, and it leads to gRPC keepalive timeout.
+            let sst_writer = <E as SstExt>::SstWriterBuilder::new()
+                .set_db(&engine)
+                .set_cf(name_to_cf(req.get_sst().get_cf_name()).unwrap())
+                .build(importer.get_path(req.get_sst()).to_str().unwrap())
+                .unwrap();
+
             // FIXME: download() should be an async fn, to allow BR to cancel
             // a download task.
             // Unfortunately, this currently can't happen because the S3Storage
             // is not Send + Sync. See the documentation of S3Storage for reason.
-            let res = importer.download::<RocksEngine>(
+            let res = importer.download::<E>(
                 req.get_sst(),
                 req.get_storage_backend(),
                 req.get_name(),
@@ -213,11 +233,7 @@ impl<Router: RaftStoreRouter<RocksEngine>> ImportSst for ImportSSTService<Router
             send_rpc_response!(resp, sink, label, timer);
         };
 
-        let thread_handle = self.threads.clone();
-        let ctx_task = async move {
-            thread_handle.spawn_ok(handle_task);
-        };
-        ctx.spawn(Compat::new(ctx_task.unit_error().boxed()));
+        self.threads.spawn_ok(handle_task);
     }
 
     /// Ingest the file by sending a raft command to raftstore.
@@ -231,12 +247,11 @@ impl<Router: RaftStoreRouter<RocksEngine>> ImportSst for ImportSSTService<Router
         mut req: IngestRequest,
         sink: UnarySink<IngestResponse>,
     ) {
-        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
-            return;
-        }
         let label = "ingest";
         let timer = Instant::now_coarse();
 
+        let mut resp = IngestResponse::default();
+        let mut errorpb = errorpb::Error::default();
         if self.switcher.get_mode() == SwitchMode::Normal
             && self
                 .engine
@@ -246,66 +261,107 @@ impl<Router: RaftStoreRouter<RocksEngine>> ImportSst for ImportSSTService<Router
             let err = "too many sst files are ingesting";
             let mut server_is_busy_err = errorpb::ServerIsBusy::default();
             server_is_busy_err.set_reason(err.to_string());
-            let mut errorpb = errorpb::Error::default();
             errorpb.set_message(err.to_string());
             errorpb.set_server_is_busy(server_is_busy_err);
-            let mut resp = IngestResponse::default();
             resp.set_error(errorpb);
-            ctx.spawn(sink.success(resp).map_err(|e| {
-                warn!("send rpc failed"; "err" => %e);
-            }));
+            ctx.spawn(
+                sink.success(resp)
+                    .unwrap_or_else(|e| warn!("send rpc failed"; "err" => %e)),
+            );
             return;
         }
-        // Make ingest command.
-        let mut ingest = Request::default();
-        ingest.set_cmd_type(CmdType::IngestSst);
-        ingest.mut_ingest_sst().set_sst(req.take_sst());
-        let mut context = req.take_context();
+
+        if !Self::acquire_lock(&self.task_slots, req.get_sst()).unwrap_or(false) {
+            errorpb.set_message(Error::FileConflict.to_string());
+            resp.set_error(errorpb);
+            ctx.spawn(
+                sink.success(resp)
+                    .unwrap_or_else(|e| warn!("send rpc failed"; "err" => %e)),
+            );
+            return;
+        }
+
+        let meta = req.take_sst();
         let mut header = RaftRequestHeader::default();
+        let mut context = req.take_context();
+        let region_id = context.get_region_id();
         header.set_peer(context.take_peer());
-        header.set_region_id(context.get_region_id());
+        header.set_region_id(region_id);
         header.set_region_epoch(context.take_region_epoch());
+        let mut req = Request::default();
+        req.set_cmd_type(CmdType::Snap);
         let mut cmd = RaftCmdRequest::default();
-        cmd.set_header(header);
-        cmd.mut_requests().push(ingest);
-
+        cmd.set_header(header.clone());
+        cmd.set_requests(vec![req].into());
         let (cb, future) = paired_future_callback();
-        if let Err(e) = self.router.send_command(cmd, Callback::Write(cb)) {
-            let mut resp = IngestResponse::default();
-            resp.set_error(e.into());
-            ctx.spawn(sink.success(resp).map_err(|e| {
-                warn!("send rpc failed"; "err" => %e);
-            }));
-            return;
-        }
 
-        let ctx_task = async move {
-            let res = future.await.map_err(Error::from);
-            let res = match res {
-                Ok(mut res) => {
-                    let mut resp = IngestResponse::default();
-                    let mut header = res.response.take_header();
-                    if header.has_error() {
-                        resp.set_error(header.take_error());
-                    }
-                    Ok(resp)
+        let router = self.router.clone();
+        let task_slots = self.task_slots.clone();
+        let importer = self.importer.clone();
+
+        let handle_task = async move {
+            let m = meta.clone();
+            let res = async move {
+                let mut resp = IngestResponse::default();
+                if let Err(e) = router.send(RaftCommand::new(cmd, Callback::Read(cb))) {
+                    let e = handle_send_error(region_id, e);
+                    resp.set_error(e.into());
+                    return Ok(resp);
                 }
-                Err(e) => Err(e),
+
+                // Make ingest command.
+                let mut ingest = Request::default();
+                ingest.set_cmd_type(CmdType::IngestSst);
+                ingest.mut_ingest_sst().set_sst(m.clone());
+
+                let mut cmd = RaftCmdRequest::default();
+                cmd.set_header(header);
+                cmd.mut_requests().push(ingest);
+
+                let mut res = future.await.map_err(Error::from)?;
+                fail_point!("import::sst_service::ingest");
+                let mut header = res.response.take_header();
+                if header.has_error() {
+                    pb_error_inc(label, header.get_error());
+                    resp.set_error(header.take_error());
+                    return Ok(resp);
+                }
+                cmd.mut_header().set_term(header.get_current_term());
+                // Here we shall check whether the file has been ingested before. This operation
+                // must execute after geting a snapshot from raftstore to make sure that the
+                // current leader has applied to current term.
+                if !importer.exist(&m) {
+                    return Ok(resp);
+                }
+
+                let (cb, future) = paired_future_callback();
+                if let Err(e) = router.send(RaftCommand::new(cmd, Callback::write(cb))) {
+                    let e = handle_send_error(region_id, e);
+                    resp.set_error(e.into());
+                    return Ok(resp);
+                }
+
+                let mut res = future.await.map_err(Error::from)?;
+                let mut header = res.response.take_header();
+                if header.has_error() {
+                    pb_error_inc(label, header.get_error());
+                    resp.set_error(header.take_error());
+                }
+                Ok(resp)
             };
+            let res = res.await;
+            Self::release_lock(&task_slots, &meta).unwrap();
             send_rpc_response!(res, sink, label, timer);
         };
-        ctx.spawn(Compat::new(ctx_task.unit_error().boxed()));
+        self.threads.spawn_ok(handle_task);
     }
 
     fn compact(
         &mut self,
-        ctx: RpcContext<'_>,
+        _ctx: RpcContext<'_>,
         req: CompactRequest,
         sink: UnarySink<CompactResponse>,
     ) {
-        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
-            return;
-        }
         let label = "compact";
         let timer = Instant::now_coarse();
         let engine = self.engine.clone();
@@ -329,30 +385,15 @@ impl<Router: RaftStoreRouter<RocksEngine>> ImportSst for ImportSSTService<Router
             match res {
                 Ok(_) => info!(
                     "compact files in range";
-                    "start" => start.map(log_wrappers::Key),
-                    "end" => end.map(log_wrappers::Key),
+                    "start" => start.map(log_wrappers::Value::key),
+                    "end" => end.map(log_wrappers::Value::key),
                     "output_level" => ?output_level, "takes" => ?timer.elapsed()
                 ),
-                Err(ref e) => error!(%e;
+                Err(ref e) => error!(%*e;
                     "compact files in range failed";
-                    "start" => start.map(log_wrappers::Key),
-                    "end" => end.map(log_wrappers::Key),
+                    "start" => start.map(log_wrappers::Value::key),
+                    "end" => end.map(log_wrappers::Value::key),
                     "output_level" => ?output_level,
-                ),
-            }
-            let res = engine.compact_files_in_range(start, end, output_level);
-            match res {
-                Ok(_) => info!(
-                    "compact files in range";
-                    "start" => start.map(log_wrappers::Key),
-                    "end" => end.map(log_wrappers::Key),
-                    "output_level" => ?output_level, "takes" => ?timer.elapsed()
-                ),
-                Err(ref e) => error!(
-                    "compact files in range failed";
-                    "start" => start.map(log_wrappers::Key),
-                    "end" => end.map(log_wrappers::Key),
-                    "output_level" => ?output_level, "err" => %e
                 ),
             }
             let res = res
@@ -361,11 +402,7 @@ impl<Router: RaftStoreRouter<RocksEngine>> ImportSst for ImportSSTService<Router
             send_rpc_response!(res, sink, label, timer);
         };
 
-        let thread_handle = self.threads.clone();
-        let ctx_task = async move {
-            thread_handle.spawn_ok(handle_task);
-        };
-        ctx.spawn(Compat::new(ctx_task.unit_error().boxed()));
+        self.threads.spawn_ok(handle_task);
     }
 
     fn set_download_speed_limit(
@@ -374,9 +411,6 @@ impl<Router: RaftStoreRouter<RocksEngine>> ImportSst for ImportSSTService<Router
         req: SetDownloadSpeedLimitRequest,
         sink: UnarySink<SetDownloadSpeedLimitResponse>,
     ) {
-        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
-            return;
-        }
         let label = "set_download_speed_limit";
         let timer = Instant::now_coarse();
 
@@ -392,24 +426,20 @@ impl<Router: RaftStoreRouter<RocksEngine>> ImportSst for ImportSSTService<Router
             send_rpc_response!(res, sink, label, timer);
         };
 
-        ctx.spawn(Compat::new(ctx_task.unit_error().boxed()));
+        ctx.spawn(ctx_task);
     }
 
     fn write(
         &mut self,
-        ctx: RpcContext<'_>,
+        _ctx: RpcContext<'_>,
         stream: RequestStream<WriteRequest>,
         sink: ClientStreamingSink<WriteResponse>,
     ) {
-        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
-            return;
-        }
         let label = "write";
         let timer = Instant::now_coarse();
         let import = self.importer.clone();
         let engine = self.engine.clone();
-        let (rx, buf_driver) =
-            create_stream_with_buffer(stream.compat(), self.cfg.stream_channel_window);
+        let (rx, buf_driver) = create_stream_with_buffer(stream, self.cfg.stream_channel_window);
         let mut rx = rx.map_err(Error::from);
 
         let handle_task = async move {
@@ -423,19 +453,7 @@ impl<Router: RaftStoreRouter<RocksEngine>> ImportSst for ImportSSTService<Router
                     _ => return Err(Error::InvalidChunk),
                 };
 
-                let name = import.get_path(&meta);
-
-                let default = <RocksEngine as SstExt>::SstWriterBuilder::new()
-                    .set_in_memory(true)
-                    .set_db(&engine)
-                    .set_cf(CF_DEFAULT)
-                    .build(&name.to_str().unwrap())?;
-                let write = <RocksEngine as SstExt>::SstWriterBuilder::new()
-                    .set_in_memory(true)
-                    .set_db(&engine)
-                    .set_cf(CF_WRITE)
-                    .build(&name.to_str().unwrap())?;
-                let writer = match import.new_writer::<RocksEngine>(default, write, meta) {
+                let writer = match import.new_writer::<E>(&engine, meta) {
                     Ok(w) => w,
                     Err(e) => {
                         error!("build writer failed {:?}", e);
@@ -465,11 +483,32 @@ impl<Router: RaftStoreRouter<RocksEngine>> ImportSst for ImportSSTService<Router
             send_rpc_response!(res, sink, label, timer);
         };
 
-        let thread_handle = self.threads.clone();
-        let ctx_task = async move {
-            thread_handle.spawn_ok(buf_driver);
-            thread_handle.spawn_ok(handle_task);
-        };
-        ctx.spawn(Compat::new(ctx_task.unit_error().boxed()));
+        self.threads.spawn_ok(buf_driver);
+        self.threads.spawn_ok(handle_task);
     }
+}
+
+// add error statistics from pb error response
+fn pb_error_inc(type_: &str, e: &errorpb::Error) {
+    let label = if e.has_not_leader() {
+        "not_leader"
+    } else if e.has_store_not_match() {
+        "store_not_match"
+    } else if e.has_region_not_found() {
+        "region_not_found"
+    } else if e.has_key_not_in_region() {
+        "key_not_in_range"
+    } else if e.has_epoch_not_match() {
+        "epoch_not_match"
+    } else if e.has_server_is_busy() {
+        "server_is_busy"
+    } else if e.has_stale_command() {
+        "stale_command"
+    } else if e.has_raft_entry_too_large() {
+        "raft_entry_too_large"
+    } else {
+        "unknown"
+    };
+
+    IMPORTER_ERROR_VEC.with_label_values(&[type_, label]).inc();
 }

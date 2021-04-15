@@ -17,12 +17,15 @@ pub trait KvEngine:
     + WriteBatchExt
     + DBOptionsExt
     + CFNamesExt
-    + CFHandleExt
+    + CFOptionsExt
     + ImportExt
     + SstExt
     + TablePropertiesExt
     + CompactExt
     + RangePropertiesExt
+    + MvccPropertiesExt
+    + TtlPropertiesExt
+    + PerfContextExt
     + MiscExt
     + Send
     + Sync

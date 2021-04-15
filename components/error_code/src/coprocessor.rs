@@ -1,7 +1,7 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 define_error_codes!(
-    "KV-Coprocessor-",
+    "KV:Coprocessor:",
 
     LOCKED => ("Locked", "", ""),
     DEADLINE_EXCEEDED => ("DeadlineExceeded", "", ""),
@@ -12,6 +12,7 @@ define_error_codes!(
     COLUMN_OFFSET => ("ColumnOffset", "", ""),
     UNKNOWN_SIGNATURE => ("UnknownSignature", "", ""),
     EVAL => ("Eval", "", ""),
+    CORRUPTED_DATA => ("CorruptedData", "", ""),
 
     STORAGE_ERROR => ("StorageError", "", ""),
     INVALID_CHARACTER_STRING => ("InvalidCharacterString", "", "")

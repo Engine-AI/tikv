@@ -2,11 +2,11 @@
 
 use kvproto::raft_serverpb::{RaftApplyState, RaftTruncatedState};
 
+use collections::HashMap;
 use engine_rocks::RocksEngine;
 use engine_traits::{Engines, Peekable, CF_RAFT};
 use raftstore::store::*;
 use test_raftstore::*;
-use tikv_util::collections::HashMap;
 use tikv_util::config::*;
 
 fn get_raft_msg_or_default<M: protobuf::Message + Default>(
@@ -272,11 +272,6 @@ fn test_compact_size_limit<T: Simulator>(cluster: &mut Cluster<T>) {
         let before_state = &before_states[&id];
         let idx = after_state.get_index();
         assert!(idx > before_state.get_index());
-
-        for i in 0..idx {
-            let key = keys::raft_log_key(1, i);
-            assert!(engines.raft.get_value(&key).unwrap().is_none());
-        }
     }
 }
 

@@ -7,39 +7,45 @@ use std::sync::{
     Arc,
 };
 use std::thread::{Builder, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{cmp, io};
 
+#[cfg(feature = "failpoints")]
+use fail::fail_point;
 use futures::future::TryFutureExt;
 use tokio::task::spawn_local;
 
 use engine_traits::{KvEngine, RaftEngine};
-use kvproto::metapb;
-use kvproto::pdpb;
-use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest, RaftCmdRequest, SplitRequest};
+use kvproto::raft_cmdpb::{
+    AdminCmdType, AdminRequest, ChangePeerRequest, ChangePeerV2Request, RaftCmdRequest,
+    SplitRequest,
+};
 use kvproto::raft_serverpb::RaftMessage;
 use kvproto::replication_modepb::RegionReplicationStatus;
+use kvproto::{metapb, pdpb};
 use prometheus::local::LocalHistogram;
 use raft::eraftpb::ConfChangeType;
 
-use crate::coprocessor::{get_region_approximate_keys, get_region_approximate_size};
 use crate::store::cmd_resp::new_error;
 use crate::store::metrics::*;
-use crate::store::util::is_epoch_stale;
-use crate::store::util::KeysInfoFormatter;
+use crate::store::util::{is_epoch_stale, ConfChangeKind, KeysInfoFormatter};
 use crate::store::worker::split_controller::{SplitInfo, TOP_N};
 use crate::store::worker::{AutoSplitController, ReadStats};
-use crate::store::Callback;
-use crate::store::StoreInfo;
-use crate::store::{CasualMessage, PeerMsg, RaftCommand, RaftRouter, StoreMsg};
+use crate::store::{
+    Callback, CasualMessage, PeerMsg, RaftCommand, RaftRouter, SnapManager, StoreInfo, StoreMsg,
+};
 
+use collections::HashMap;
 use concurrency_manager::ConcurrencyManager;
+use futures::compat::Future01CompatExt;
+use futures::FutureExt;
 use pd_client::metrics::*;
 use pd_client::{Error, PdClient, RegionStat};
-use tikv_util::collections::HashMap;
 use tikv_util::metrics::ThreadInfoStatistics;
 use tikv_util::time::UnixSecs;
+use tikv_util::timer::GLOBAL_TIMER_HANDLE;
 use tikv_util::worker::{FutureRunnable as Runnable, FutureScheduler as Scheduler, Stopped};
+use tikv_util::{box_err, debug, error, info, thd_name, warn};
 
 type RecordPairVec = Vec<pdpb::RecordPair>;
 
@@ -73,6 +79,19 @@ where
     }
 }
 
+pub struct HeartbeatTask {
+    pub term: u64,
+    pub region: metapb::Region,
+    pub peer: metapb::Peer,
+    pub down_peers: Vec<pdpb::PeerStats>,
+    pub pending_peers: Vec<metapb::Peer>,
+    pub written_bytes: u64,
+    pub written_keys: u64,
+    pub approximate_size: u64,
+    pub approximate_keys: u64,
+    pub replication_status: Option<RegionReplicationStatus>,
+}
+
 /// Uses an asynchronous thread to tell PD something.
 pub enum Task<E>
 where
@@ -97,18 +116,7 @@ where
     AutoSplit {
         split_infos: Vec<SplitInfo>,
     },
-    Heartbeat {
-        term: u64,
-        region: metapb::Region,
-        peer: metapb::Peer,
-        down_peers: Vec<pdpb::PeerStats>,
-        pending_peers: Vec<metapb::Peer>,
-        written_bytes: u64,
-        written_keys: u64,
-        approximate_size: Option<u64>,
-        approximate_keys: Option<u64>,
-        replication_status: Option<RegionReplicationStatus>,
-    },
+    Heartbeat(HeartbeatTask),
     StoreHeartbeat {
         stats: pdpb::StoreStats,
         store_info: StoreInfo<E>,
@@ -135,6 +143,9 @@ where
         region_id: u64,
         initial_status: u64,
         max_ts_sync_status: Arc<AtomicU64>,
+    },
+    QueryRegionLeader {
+        region_id: u64,
     },
 }
 
@@ -185,6 +196,8 @@ pub struct PeerStat {
     pub last_written_bytes: u64,
     pub last_written_keys: u64,
     pub last_report_ts: UnixSecs,
+    pub approximate_keys: u64,
+    pub approximate_size: u64,
 }
 
 impl<E> Display for Task<E>
@@ -201,15 +214,11 @@ where
                 f,
                 "ask split region {} with key {}",
                 region.get_id(),
-                hex::encode_upper(&split_key),
+                log_wrappers::Value::key(&split_key),
             ),
-            Task::AutoSplit {
-                ref split_infos,
-            } => write!(
-                f,
-                "auto split split regions, num is {}",
-                split_infos.len(),
-            ),
+            Task::AutoSplit { ref split_infos } => {
+                write!(f, "auto split split regions, num is {}", split_infos.len(),)
+            }
             Task::AskBatchSplit {
                 ref region,
                 ref split_keys,
@@ -220,17 +229,12 @@ where
                 region.get_id(),
                 KeysInfoFormatter(split_keys.iter())
             ),
-            Task::Heartbeat {
-                ref region,
-                ref peer,
-                ref replication_status,
-                ..
-            } => write!(
+            Task::Heartbeat(ref hb_task) => write!(
                 f,
                 "heartbeat for region {:?}, leader {}, replication status {:?}",
-                region,
-                peer.get_id(),
-                replication_status
+                hb_task.region,
+                hb_task.peer.get_id(),
+                hb_task.replication_status
             ),
             Task::StoreHeartbeat { ref stats, .. } => {
                 write!(f, "store heartbeat stats: {:?}", stats)
@@ -239,11 +243,7 @@ where
             Task::ValidatePeer {
                 ref region,
                 ref peer,
-            } => write!(
-                f,
-                "validate peer {:?} with region {:?}",
-                peer, region
-            ),
+            } => write!(f, "validate peer {:?} with region {:?}", peer, region),
             Task::ReadStats { ref read_stats } => {
                 write!(f, "get the read statistics {:?}", read_stats)
             }
@@ -259,11 +259,14 @@ where
                 "get store's informations: cpu_usages {:?}, read_io_rates {:?}, write_io_rates {:?}",
                 cpu_usages, read_io_rates, write_io_rates,
             ),
-            Task::UpdateMaxTimestamp { region_id, ..} => write!(
+            Task::UpdateMaxTimestamp { region_id, .. } => write!(
                 f,
                 "update the max timestamp for region {} in the concurrency manager",
                 region_id
             ),
+            Task::QueryRegionLeader { region_id } => {
+                write!(f, "query the leader of region {}", region_id)
+            }
         }
     }
 }
@@ -427,7 +430,6 @@ where
     store_id: u64,
     pd_client: Arc<T>,
     router: RaftRouter<EK, ER>,
-    db: EK,
     region_peers: HashMap<u64, PeerStat>,
     store_stat: StoreStat,
     is_hb_receiver_scheduled: bool,
@@ -441,6 +443,7 @@ where
     stats_monitor: StatsMonitor<EK>,
 
     concurrency_manager: ConcurrencyManager,
+    snap_mgr: SnapManager,
 }
 
 impl<EK, ER, T> Runner<EK, ER, T>
@@ -455,11 +458,11 @@ where
         store_id: u64,
         pd_client: Arc<T>,
         router: RaftRouter<EK, ER>,
-        db: EK,
         scheduler: Scheduler<Task<EK>>,
         store_heartbeat_interval: Duration,
         auto_split_controller: AutoSplitController,
         concurrency_manager: ConcurrencyManager,
+        snap_mgr: SnapManager,
     ) -> Runner<EK, ER, T> {
         let interval = store_heartbeat_interval / Self::INTERVAL_DIVISOR;
         let mut stats_monitor = StatsMonitor::new(interval, scheduler.clone());
@@ -471,7 +474,6 @@ where
             store_id,
             pd_client,
             router,
-            db,
             is_hb_receiver_scheduled: false,
             region_peers: HashMap::default(),
             store_stat: StoreStat::default(),
@@ -479,6 +481,7 @@ where
             scheduler,
             stats_monitor,
             concurrency_manager,
+            snap_mgr,
         }
     }
 
@@ -664,21 +667,15 @@ where
         };
         stats.set_capacity(capacity);
 
-        // already include size of snapshot files
-        let used_size =
-            stats.get_used_size() + store_info.engine.get_engine_used_size().expect("cf");
+        let used_size = self.snap_mgr.get_total_snap_size().unwrap()
+            + store_info.engine.get_engine_used_size().expect("cf");
         stats.set_used_size(used_size);
 
-        let mut available = if capacity > used_size {
-            capacity - used_size
-        } else {
-            warn!("no available space");
-            0
-        };
-
+        let mut available = capacity.checked_sub(used_size).unwrap_or_default();
         // We only care about rocksdb SST file size, so we should check disk available here.
-        if available > disk_stats.free_space() {
-            available = disk_stats.free_space();
+        available = cmp::min(available, disk_stats.available_space());
+        if available == 0 {
+            warn!("no available space");
         }
 
         stats.set_available(available);
@@ -832,6 +829,20 @@ where
                         change_peer.take_peer(),
                     );
                     send_admin_request(&router, region_id, epoch, peer, req, Callback::None);
+                } else if resp.has_change_peer_v2() {
+                    PD_HEARTBEAT_COUNTER_VEC
+                        .with_label_values(&["change peer"])
+                        .inc();
+
+                    let mut change_peer_v2 = resp.take_change_peer_v2();
+                    info!(
+                        "try to change peer";
+                        "region_id" => region_id,
+                        "changes" => ?change_peer_v2.get_changes(),
+                        "kind" => ?ConfChangeKind::confchange_kind(change_peer_v2.get_changes().len()),
+                    );
+                    let req = new_change_peer_v2_request(change_peer_v2.take_changes().into());
+                    send_admin_request(&router, region_id, epoch, peer, req, Callback::None);
                 } else if resp.has_transfer_leader() {
                     PD_HEARTBEAT_COUNTER_VEC
                         .with_label_values(&["transfer leader"])
@@ -858,11 +869,13 @@ where
                             region_epoch: epoch,
                             split_keys: split_region.take_keys().into(),
                             callback: Callback::None,
+                            source: "pd".into(),
                         }
                     } else {
                         CasualMessage::HalfSplitRegion {
                             region_epoch: epoch,
                             policy: split_region.get_policy(),
+                            source: "pd",
                         }
                     };
                     if let Err(e) = router.send(region_id, PeerMsg::CasualMessage(msg)) {
@@ -894,16 +907,16 @@ where
         self.is_hb_receiver_scheduled = true;
     }
 
-    fn handle_read_stats(&mut self, read_stats: ReadStats) {
-        for (region_id, stats) in &read_stats.flows {
+    fn handle_read_stats(&mut self, mut read_stats: ReadStats) {
+        for (region_id, region_info) in read_stats.region_infos.iter_mut() {
             let peer_stat = self
                 .region_peers
                 .entry(*region_id)
                 .or_insert_with(PeerStat::default);
-            peer_stat.read_bytes += stats.read_bytes as u64;
-            peer_stat.read_keys += stats.read_keys as u64;
-            self.store_stat.engine_total_bytes_read += stats.read_bytes as u64;
-            self.store_stat.engine_total_keys_read += stats.read_keys as u64;
+            peer_stat.read_bytes += region_info.flow.read_bytes as u64;
+            peer_stat.read_keys += region_info.flow.read_keys as u64;
+            self.store_stat.engine_total_bytes_read += region_info.flow.read_bytes as u64;
+            self.store_stat.engine_total_keys_read += region_info.flow.read_keys as u64;
         }
         if !read_stats.region_infos.is_empty() {
             if let Some(sender) = self.stats_monitor.get_sender() {
@@ -945,14 +958,16 @@ where
             while max_ts_sync_status.load(Ordering::SeqCst) == initial_status {
                 match pd_client.get_tso().await {
                     Ok(ts) => {
-                        concurrency_manager.update_max_read_ts(ts);
+                        concurrency_manager.update_max_ts(ts);
                         // Set the least significant bit to 1 to mark it as synced.
-                        let old_value = max_ts_sync_status.compare_and_swap(
-                            initial_status,
-                            initial_status | 1,
-                            Ordering::SeqCst,
-                        );
-                        success = old_value == initial_status;
+                        success = max_ts_sync_status
+                            .compare_exchange(
+                                initial_status,
+                                initial_status | 1,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            )
+                            .is_ok();
                         break;
                     }
                     Err(e) => {
@@ -971,6 +986,41 @@ where
                     "region_id" => region_id,
                     "initial_status" => initial_status,
                 );
+            }
+        };
+
+        #[cfg(feature = "failpoints")]
+        let delay = (|| {
+            fail_point!("delay_update_max_ts", |_| true);
+            false
+        })();
+        #[cfg(not(feature = "failpoints"))]
+        let delay = false;
+
+        if delay {
+            info!("[failpoint] delay update max ts for 1s"; "region_id" => region_id);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            spawn_local(GLOBAL_TIMER_HANDLE.delay(deadline).compat().then(|_| f));
+        } else {
+            spawn_local(f);
+        }
+    }
+
+    fn handle_query_region_leader(&self, region_id: u64) {
+        let router = self.router.clone();
+        let resp = self.pd_client.get_region_leader_by_id(region_id);
+        let f = async move {
+            match resp.await {
+                Ok(Some((region, leader))) => {
+                    let msg = CasualMessage::QueryRegionLeaderResp { region, leader };
+                    if let Err(e) = router.send(region_id, PeerMsg::CasualMessage(msg)) {
+                        error!("send region info message failed"; "region_id" => region_id, "err" => ?e);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    error!("get region failed"; "err" => ?e);
+                }
             }
         };
         spawn_local(f);
@@ -1050,24 +1100,7 @@ where
                 spawn_local(f);
             }
 
-            Task::Heartbeat {
-                term,
-                region,
-                peer,
-                down_peers,
-                pending_peers,
-                written_bytes,
-                written_keys,
-                approximate_size,
-                approximate_keys,
-                replication_status,
-            } => {
-                let approximate_size = approximate_size.unwrap_or_else(|| {
-                    get_region_approximate_size(&self.db, &region, 0).unwrap_or_default()
-                });
-                let approximate_keys = approximate_keys.unwrap_or_else(|| {
-                    get_region_approximate_keys(&self.db, &region, 0).unwrap_or_default()
-                });
+            Task::Heartbeat(hb_task) => {
                 let (
                     read_bytes_delta,
                     read_keys_delta,
@@ -1077,15 +1110,17 @@ where
                 ) = {
                     let peer_stat = self
                         .region_peers
-                        .entry(region.get_id())
+                        .entry(hb_task.region.get_id())
                         .or_insert_with(PeerStat::default);
+                    peer_stat.approximate_size = hb_task.approximate_size;
+                    peer_stat.approximate_keys = hb_task.approximate_keys;
                     let read_bytes_delta = peer_stat.read_bytes - peer_stat.last_read_bytes;
                     let read_keys_delta = peer_stat.read_keys - peer_stat.last_read_keys;
-                    let written_bytes_delta = written_bytes - peer_stat.last_written_bytes;
-                    let written_keys_delta = written_keys - peer_stat.last_written_keys;
+                    let written_bytes_delta = hb_task.written_bytes - peer_stat.last_written_bytes;
+                    let written_keys_delta = hb_task.written_keys - peer_stat.last_written_keys;
                     let mut last_report_ts = peer_stat.last_report_ts;
-                    peer_stat.last_written_bytes = written_bytes;
-                    peer_stat.last_written_keys = written_keys;
+                    peer_stat.last_written_bytes = hb_task.written_bytes;
+                    peer_stat.last_written_keys = hb_task.written_keys;
                     peer_stat.last_read_bytes = peer_stat.read_bytes;
                     peer_stat.last_read_keys = peer_stat.read_keys;
                     peer_stat.last_report_ts = UnixSecs::now();
@@ -1101,21 +1136,21 @@ where
                     )
                 };
                 self.handle_heartbeat(
-                    term,
-                    region,
-                    peer,
+                    hb_task.term,
+                    hb_task.region,
+                    hb_task.peer,
                     RegionStat {
-                        down_peers,
-                        pending_peers,
+                        down_peers: hb_task.down_peers,
+                        pending_peers: hb_task.pending_peers,
                         written_bytes: written_bytes_delta,
                         written_keys: written_keys_delta,
                         read_bytes: read_bytes_delta,
                         read_keys: read_keys_delta,
-                        approximate_size,
-                        approximate_keys,
+                        approximate_size: hb_task.approximate_size,
+                        approximate_keys: hb_task.approximate_keys,
                         last_report_ts,
                     },
-                    replication_status,
+                    hb_task.replication_status,
                 )
             }
             Task::StoreHeartbeat { stats, store_info } => {
@@ -1135,6 +1170,7 @@ where
                 initial_status,
                 max_ts_sync_status,
             } => self.handle_update_max_timestamp(region_id, initial_status, max_ts_sync_status),
+            Task::QueryRegionLeader { region_id } => self.handle_query_region_leader(region_id),
         };
     }
 
@@ -1148,6 +1184,24 @@ fn new_change_peer_request(change_type: ConfChangeType, peer: metapb::Peer) -> A
     req.set_cmd_type(AdminCmdType::ChangePeer);
     req.mut_change_peer().set_change_type(change_type);
     req.mut_change_peer().set_peer(peer);
+    req
+}
+
+fn new_change_peer_v2_request(changes: Vec<pdpb::ChangePeer>) -> AdminRequest {
+    let mut req = AdminRequest::default();
+    req.set_cmd_type(AdminCmdType::ChangePeerV2);
+    let change_peer_reqs = changes
+        .into_iter()
+        .map(|mut c| {
+            let mut cp = ChangePeerRequest::default();
+            cp.set_change_type(c.get_change_type());
+            cp.set_peer(c.take_peer());
+            cp
+        })
+        .collect();
+    let mut cp = ChangePeerV2Request::default();
+    cp.set_changes(change_peer_reqs);
+    req.set_change_peer_v2(cp);
     req
 }
 
@@ -1257,7 +1311,7 @@ fn send_destroy_peer_message<EK, ER>(
 #[cfg(not(target_os = "macos"))]
 #[cfg(test)]
 mod tests {
-    use engine_rocks::RocksEngine;
+    use engine_test::kv::KvTestEngine;
     use std::sync::Mutex;
     use std::time::Instant;
     use tikv_util::worker::FutureWorker;
@@ -1266,13 +1320,13 @@ mod tests {
 
     struct RunnerTest {
         store_stat: Arc<Mutex<StoreStat>>,
-        stats_monitor: StatsMonitor<RocksEngine>,
+        stats_monitor: StatsMonitor<KvTestEngine>,
     }
 
     impl RunnerTest {
         fn new(
             interval: u64,
-            scheduler: Scheduler<Task<RocksEngine>>,
+            scheduler: Scheduler<Task<KvTestEngine>>,
             store_stat: Arc<Mutex<StoreStat>>,
         ) -> RunnerTest {
             let mut stats_monitor = StatsMonitor::new(Duration::from_secs(interval), scheduler);
@@ -1300,8 +1354,8 @@ mod tests {
         }
     }
 
-    impl Runnable<Task<RocksEngine>> for RunnerTest {
-        fn run(&mut self, task: Task<RocksEngine>) {
+    impl Runnable<Task<KvTestEngine>> for RunnerTest {
+        fn run(&mut self, task: Task<KvTestEngine>) {
             if let Task::StoreInfos {
                 cpu_usages,
                 read_io_rates,

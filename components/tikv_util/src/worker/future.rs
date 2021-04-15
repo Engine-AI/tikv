@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, Builder, JoinHandle};
 
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
-use futures::executor::block_on;
 use futures::stream::StreamExt;
 use tokio::task::LocalSet;
 
@@ -41,7 +40,7 @@ pub trait Runnable<T: Display> {
 
 /// Scheduler provides interface to schedule task to underlying workers.
 pub struct Scheduler<T> {
-    name: Arc<String>,
+    name: Arc<str>,
     sender: UnboundedSender<Option<T>>,
     metrics_pending_task_count: IntGauge,
 }
@@ -52,11 +51,11 @@ pub fn dummy_scheduler<T: Display>() -> Scheduler<T> {
 }
 
 impl<T: Display> Scheduler<T> {
-    fn new<S: Into<String>>(name: S, sender: UnboundedSender<Option<T>>) -> Scheduler<T> {
+    pub fn new<S: Into<Arc<str>>>(name: S, sender: UnboundedSender<Option<T>>) -> Scheduler<T> {
         let name = name.into();
         Scheduler {
             metrics_pending_task_count: WORKER_PENDING_TASK_VEC.with_label_values(&[&name]),
-            name: Arc::new(name),
+            name,
             sender,
         }
     }
@@ -117,7 +116,11 @@ where
             }
         };
         // `UnboundedReceiver` never returns an error.
-        block_on(handle.run_until(task));
+        tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .build()
+            .unwrap()
+            .block_on(handle.run_until(task));
     }
     runner.shutdown();
     tikv_alloc::remove_thread_memory_accessor();
@@ -125,7 +128,7 @@ where
 
 impl<T: Display + Send + 'static> Worker<T> {
     /// Creates a worker.
-    pub fn new<S: Into<String>>(name: S) -> Worker<T> {
+    pub fn new<S: Into<Arc<str>>>(name: S) -> Worker<T> {
         let (tx, rx) = unbounded();
         Worker {
             scheduler: Scheduler::new(name, tx),
@@ -173,7 +176,7 @@ impl<T: Display + Send + 'static> Worker<T> {
     }
 
     pub fn name(&self) -> &str {
-        self.scheduler.name.as_str()
+        &self.scheduler.name
     }
 
     /// Stops the worker thread.
@@ -248,5 +251,22 @@ mod tests {
         assert!(worker.is_busy());
         // when shutdown, StepRunner should send back a 0.
         assert_eq!(0, rx.recv().unwrap());
+    }
+
+    #[test]
+    fn test_block_on_inside_worker() {
+        struct BlockingRunner;
+
+        impl Runnable<bool> for BlockingRunner {
+            fn run(&mut self, _: bool) {
+                futures::executor::block_on(async {});
+            }
+        }
+
+        let mut worker = Worker::new("test-block-on-worker");
+        worker.start(BlockingRunner).unwrap();
+        worker.schedule(true).unwrap();
+        worker.schedule(false).unwrap();
+        worker.stop().unwrap().join().unwrap();
     }
 }

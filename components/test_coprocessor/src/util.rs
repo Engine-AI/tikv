@@ -2,8 +2,8 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use futures03::executor::block_on;
-use futures03::stream::StreamExt;
+use futures::executor::block_on;
+use futures::stream::StreamExt;
 use protobuf::Message;
 
 use kvproto::coprocessor::{Request, Response};
@@ -65,5 +65,5 @@ pub fn offset_for_column(cols: &[ColumnInfo], col_id: i64) -> i64 {
             return offset as i64;
         }
     }
-    0 as i64
+    0_i64
 }

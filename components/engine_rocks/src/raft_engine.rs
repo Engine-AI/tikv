@@ -1,16 +1,22 @@
+// Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
+
 use crate::{RocksEngine, RocksWriteBatch};
 
 use engine_traits::{Error, RaftEngine, RaftLogBatch, Result};
 use engine_traits::{
-    Iterable, KvEngine, MiscExt, Mutable, Peekable, SyncMutable, WriteBatchExt, WriteOptions,
-    CF_DEFAULT, MAX_DELETE_BATCH_COUNT,
+    Iterable, KvEngine, MiscExt, Mutable, Peekable, SyncMutable, WriteBatch, WriteBatchExt,
+    WriteOptions, CF_DEFAULT,
 };
 use kvproto::raft_serverpb::RaftLocalState;
 use protobuf::Message;
 use raft::eraftpb::Entry;
+use tikv_util::{box_err, box_try};
 
 const RAFT_LOG_MULTI_GET_CNT: u64 = 8;
 
+// FIXME: RaftEngine should probably be implemented generically
+// for all KvEngines, but is currently implemented separately for
+// every engine.
 impl RaftEngine for RocksEngine {
     type LogBatch = RocksWriteBatch;
 
@@ -108,7 +114,7 @@ impl RaftEngine for RocksEngine {
         let bytes = batch.data_size();
         let mut opts = WriteOptions::default();
         opts.set_sync(sync_log);
-        self.write_opt(batch, &opts)?;
+        batch.write_opt(&opts)?;
         batch.clear();
         Ok(bytes)
     }
@@ -131,7 +137,7 @@ impl RaftEngine for RocksEngine {
         &self,
         raft_group_id: u64,
         state: &RaftLocalState,
-        batch: &mut RocksWriteBatch,
+        batch: &mut Self::LogBatch,
     ) -> Result<()> {
         batch.delete(&keys::raft_state_key(raft_group_id))?;
         let seek_key = keys::raft_log_key(raft_group_id, 0);
@@ -154,13 +160,9 @@ impl RaftEngine for RocksEngine {
     }
 
     fn append(&self, raft_group_id: u64, entries: Vec<Entry>) -> Result<usize> {
-        self.append_slice(raft_group_id, &entries)
-    }
-
-    fn append_slice(&self, raft_group_id: u64, entries: &[Entry]) -> Result<usize> {
         let mut wb = RocksWriteBatch::new(self.as_inner().clone());
         let buf = Vec::with_capacity(1024);
-        wb.append_impl(raft_group_id, entries, buf)?;
+        wb.append_impl(raft_group_id, &entries, buf)?;
         self.consume(&mut wb, false)
     }
 
@@ -186,15 +188,15 @@ impl RaftEngine for RocksEngine {
         for idx in from..to {
             let key = keys::raft_log_key(raft_group_id, idx);
             raft_wb.delete(&key)?;
-            if raft_wb.count() >= MAX_DELETE_BATCH_COUNT {
-                self.write(&raft_wb)?;
+            if raft_wb.count() >= Self::WRITE_BATCH_MAX_KEYS {
+                raft_wb.write()?;
                 raft_wb.clear();
             }
         }
 
         // TODO: disable WAL here.
-        if !Mutable::is_empty(&raft_wb) {
-            self.write(&raft_wb)?;
+        if !WriteBatch::is_empty(&raft_wb) {
+            raft_wb.write()?;
         }
         Ok((to - from) as usize)
     }
@@ -210,6 +212,7 @@ impl RaftEngine for RocksEngine {
     fn flush_metrics(&self, instance: &str) {
         KvEngine::flush_metrics(self, instance)
     }
+
     fn reset_statistics(&self) {
         KvEngine::reset_statistics(self)
     }
@@ -221,13 +224,9 @@ impl RaftEngine for RocksEngine {
 
 impl RaftLogBatch for RocksWriteBatch {
     fn append(&mut self, raft_group_id: u64, entries: Vec<Entry>) -> Result<()> {
-        self.append_slice(raft_group_id, &entries)
-    }
-
-    fn append_slice(&mut self, raft_group_id: u64, entries: &[Entry]) -> Result<()> {
         if let Some(max_size) = entries.iter().map(|e| e.compute_size()).max() {
             let ser_buf = Vec::with_capacity(max_size as usize);
-            return self.append_impl(raft_group_id, entries, ser_buf);
+            return self.append_impl(raft_group_id, &entries, ser_buf);
         }
         Ok(())
     }
@@ -244,7 +243,7 @@ impl RaftLogBatch for RocksWriteBatch {
     }
 
     fn is_empty(&self) -> bool {
-        Mutable::is_empty(self)
+        WriteBatch::is_empty(self)
     }
 }
 

@@ -16,7 +16,7 @@ use uuid::Error as UuidError;
 
 use crate::metrics::*;
 
-pub fn error_inc(err: &Error) {
+pub fn error_inc(type_: &str, err: &Error) {
     let label = match err {
         Error::Io(..) => "io",
         Error::Grpc(..) => "grpc",
@@ -35,7 +35,7 @@ pub fn error_inc(err: &Error) {
         Error::CodecError(..) => "codec",
         _ => return,
     };
-    IMPORTER_ERROR_VEC.with_label_values(&[label]).inc();
+    IMPORTER_ERROR_VEC.with_label_values(&[type_, label]).inc();
 }
 
 quick_error! {
@@ -75,8 +75,8 @@ quick_error! {
             cause(err)
             display("{}", err)
         }
-        FileExists(path: PathBuf) {
-            display("File {:?} exists", path)
+        FileExists(path: PathBuf, action: &'static str) {
+            display("File {:?} exists, cannot {}", path, action)
         }
         FileCorrupted(path: PathBuf, reason: String) {
             display("File {:?} corrupted: {}", path, reason)
@@ -98,8 +98,8 @@ quick_error! {
             display("\
                 {} has wrong prefix: key {} does not start with {}",
                 what,
-                hex::encode_upper(&key),
-                hex::encode_upper(&prefix),
+                log_wrappers::Value::key(&key),
+                log_wrappers::Value::key(&prefix),
             )
         }
         BadFormat(msg: String) {
@@ -113,6 +113,9 @@ quick_error! {
             from()
             cause(err)
             display("Codec {}", err)
+        }
+        FileConflict {
+            display("ingest file conflict")
         }
     }
 }
@@ -137,18 +140,19 @@ impl ErrorCodeExt for Error {
             Error::RocksDB(_) => error_code::sst_importer::ROCKSDB,
             Error::EngineTraits(e) => e.error_code(),
             Error::ParseIntError(_) => error_code::sst_importer::PARSE_INT_ERROR,
-            Error::FileExists(_) => error_code::sst_importer::FILE_EXISTS,
-            Error::FileCorrupted(_, _) => error_code::sst_importer::FILE_CORRUPTED,
+            Error::FileExists(..) => error_code::sst_importer::FILE_EXISTS,
+            Error::FileCorrupted(..) => error_code::sst_importer::FILE_CORRUPTED,
             Error::InvalidSSTPath(_) => error_code::sst_importer::INVALID_SST_PATH,
             Error::InvalidChunk => error_code::sst_importer::INVALID_CHUNK,
             Error::Engine(_) => error_code::sst_importer::ENGINE,
-            Error::CannotReadExternalStorage(_, _, _, _) => {
+            Error::CannotReadExternalStorage(..) => {
                 error_code::sst_importer::CANNOT_READ_EXTERNAL_STORAGE
             }
-            Error::WrongKeyPrefix(_, _, _) => error_code::sst_importer::WRONG_KEY_PREFIX,
+            Error::WrongKeyPrefix(..) => error_code::sst_importer::WRONG_KEY_PREFIX,
             Error::BadFormat(_) => error_code::sst_importer::BAD_FORMAT,
             Error::Encryption(e) => e.error_code(),
             Error::CodecError(e) => e.error_code(),
+            Error::FileConflict => error_code::sst_importer::FILE_CONFLICT,
         }
     }
 }

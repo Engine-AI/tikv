@@ -12,18 +12,26 @@ use kvproto::encryptionpb::EncryptionMethod;
 use kvproto::kvrpcpb::*;
 use kvproto::metapb::{self, RegionEpoch};
 use kvproto::pdpb::{
-    ChangePeer, CheckPolicy, Merge, RegionHeartbeatResponse, SplitRegion, TransferLeader,
+    ChangePeer, ChangePeerV2, CheckPolicy, Merge, RegionHeartbeatResponse, SplitRegion,
+    TransferLeader,
 };
 use kvproto::raft_cmdpb::{AdminCmdType, CmdType, StatusCmdType};
-use kvproto::raft_cmdpb::{AdminRequest, RaftCmdRequest, RaftCmdResponse, Request, StatusRequest};
+use kvproto::raft_cmdpb::{
+    AdminRequest, ChangePeerRequest, ChangePeerV2Request, RaftCmdRequest, RaftCmdResponse, Request,
+    StatusRequest,
+};
 use kvproto::raft_serverpb::{PeerState, RaftLocalState, RegionLocalState};
 use kvproto::tikvpb::TikvClient;
 use raft::eraftpb::ConfChangeType;
 
-use encryption::{DataKeyManager, FileConfig, MasterKeyConfig};
+use encryption_export::{
+    data_key_manager_from_config, DataKeyManager, FileConfig, MasterKeyConfig,
+};
 use engine_rocks::config::BlobRunMode;
-use engine_rocks::encryption::get_env;
 use engine_rocks::raw::DB;
+use engine_rocks::{
+    encryption::get_env as get_encrypted_env, file_system::get_env as get_inspected_env,
+};
 use engine_rocks::{CompactionListener, RocksCompactionJobInfo};
 use engine_rocks::{Compat, RocksEngine, RocksSnapshot};
 use engine_traits::{Engines, Iterable, Peekable};
@@ -31,9 +39,10 @@ use raftstore::store::fsm::RaftRouter;
 use raftstore::store::*;
 use raftstore::Result;
 use tikv::config::*;
-use tikv::storage::config::DEFAULT_ROCKSDB_SUB_DIR;
+use tikv::storage::point_key_range;
 use tikv_util::config::*;
 use tikv_util::{escape, HandyRwLock};
+use txn_types::Key;
 
 use super::*;
 
@@ -53,7 +62,7 @@ pub fn must_get(engine: &Arc<DB>, cf: &str, key: &[u8], value: Option<&[u8]>) {
         }
         thread::sleep(Duration::from_millis(20));
     }
-    debug!("last try to get {}", hex::encode_upper(key));
+    debug!("last try to get {}", log_wrappers::hex_encode_upper(key));
     let res = engine.c().get_value_cf(cf, &keys::data_key(key)).unwrap();
     if value.is_none() && res.is_none()
         || value.is_some() && res.is_some() && value.unwrap() == &*res.unwrap()
@@ -63,7 +72,7 @@ pub fn must_get(engine: &Arc<DB>, cf: &str, key: &[u8], value: Option<&[u8]>) {
     panic!(
         "can't get value {:?} for key {}",
         value.map(escape),
-        hex::encode_upper(key)
+        log_wrappers::hex_encode_upper(key)
     )
 }
 
@@ -255,6 +264,15 @@ pub fn new_change_peer_request(change_type: ConfChangeType, peer: metapb::Peer) 
     req
 }
 
+pub fn new_change_peer_v2_request(changes: Vec<ChangePeerRequest>) -> AdminRequest {
+    let mut cp = ChangePeerV2Request::default();
+    cp.set_changes(changes.into());
+    let mut req = AdminRequest::default();
+    req.set_cmd_type(AdminCmdType::ChangePeerV2);
+    req.set_change_peer_v2(cp);
+    req
+}
+
 pub fn new_compact_log_request(index: u64, term: u64) -> AdminRequest {
     let mut req = AdminRequest::default();
     req.set_cmd_type(AdminCmdType::CompactLog);
@@ -304,6 +322,15 @@ pub fn new_pd_change_peer(
 
     let mut resp = RegionHeartbeatResponse::default();
     resp.set_change_peer(change_peer);
+    resp
+}
+
+pub fn new_pd_change_peer_v2(changes: Vec<ChangePeer>) -> RegionHeartbeatResponse {
+    let mut change_peer = ChangePeerV2::default();
+    change_peer.set_changes(changes.into());
+
+    let mut resp = RegionHeartbeatResponse::default();
+    resp.set_change_peer_v2(change_peer);
     resp
 }
 
@@ -357,12 +384,25 @@ pub fn make_cb(cmd: &RaftCmdRequest) -> (Callback<RocksSnapshot>, mpsc::Receiver
             let _ = tx.send(resp.response);
         }))
     } else {
-        Callback::Write(Box::new(move |resp: WriteResponse| {
+        Callback::write(Box::new(move |resp: WriteResponse| {
             // we don't care error actually.
             let _ = tx.send(resp.response);
         }))
     };
     (cb, rx)
+}
+
+pub fn make_cb_ext(
+    cmd: &RaftCmdRequest,
+    proposed: Option<ExtCallback>,
+    committed: Option<ExtCallback>,
+) -> (Callback<RocksSnapshot>, mpsc::Receiver<RaftCmdResponse>) {
+    let (cb, receiver) = make_cb(cmd);
+    if let Callback::Write { cb, .. } = cb {
+        (Callback::write_ext(cb, proposed, committed), receiver)
+    } else {
+        (cb, receiver)
+    }
 }
 
 // Issue a read request on the specified peer.
@@ -458,6 +498,32 @@ pub fn read_index_on_peer<T: Simulator>(
     cluster.read(None, request, timeout)
 }
 
+pub fn async_read_index_on_peer<T: Simulator>(
+    cluster: &mut Cluster<T>,
+    peer: metapb::Peer,
+    region: metapb::Region,
+    key: &[u8],
+    read_quorum: bool,
+) -> mpsc::Receiver<RaftCmdResponse> {
+    let node_id = peer.get_store_id();
+    let mut cmd = new_read_index_cmd();
+    cmd.mut_read_index().set_start_ts(u64::MAX);
+    cmd.mut_read_index()
+        .mut_key_ranges()
+        .push(point_key_range(Key::from_raw(key)));
+    let mut request = new_request(
+        region.get_id(),
+        region.get_region_epoch().clone(),
+        vec![cmd],
+        read_quorum,
+    );
+    request.mut_header().set_peer(peer);
+    let (tx, rx) = mpsc::sync_channel(1);
+    let cb = Callback::Read(Box::new(move |resp| drop(tx.send(resp.response))));
+    cluster.sim.wl().async_read(node_id, None, request, cb);
+    rx
+}
+
 pub fn must_get_value(resp: &RaftCmdResponse) -> Vec<u8> {
     if resp.get_header().has_error() {
         panic!("failed to read {:?}", resp);
@@ -480,7 +546,7 @@ pub fn must_read_on_peer<T: Simulator>(
         Ok(ref resp) if value == must_get_value(resp).as_slice() => (),
         other => panic!(
             "read key {}, expect value {:?}, got {:?}",
-            hex::encode_upper(key),
+            log_wrappers::hex_encode_upper(key),
             value,
             other
         ),
@@ -499,11 +565,18 @@ pub fn must_error_read_on_peer<T: Simulator>(
             let value = resp.mut_responses()[0].mut_get().take_value();
             panic!(
                 "key {}, expect error but got {}",
-                hex::encode_upper(key),
+                log_wrappers::hex_encode_upper(key),
                 escape(&value)
             );
         }
     }
+}
+
+pub fn must_contains_error(resp: &RaftCmdResponse, msg: &str) {
+    let header = resp.get_header();
+    assert!(header.has_error());
+    let err_msg = header.get_error().get_message();
+    assert!(err_msg.contains(msg), "{:?}", resp);
 }
 
 fn dummpy_filter(_: &RocksCompactionJobInfo) -> bool {
@@ -521,11 +594,12 @@ pub fn create_test_engine(
 ) {
     let dir = Builder::new().prefix("test_cluster").tempdir().unwrap();
     let key_manager =
-        DataKeyManager::from_config(&cfg.security.encryption, dir.path().to_str().unwrap())
+        data_key_manager_from_config(&cfg.security.encryption, dir.path().to_str().unwrap())
             .unwrap()
-            .map(|key_manager| Arc::new(key_manager));
+            .map(Arc::new);
 
-    let env = get_env(key_manager.clone(), None).unwrap();
+    let env = get_encrypted_env(key_manager.clone(), None).unwrap();
+    let env = get_inspected_env(Some(env)).unwrap();
     let cache = cfg.storage.block_cache.build_shared_cache();
 
     let kv_path = dir.path().join(DEFAULT_ROCKSDB_SUB_DIR);
@@ -536,7 +610,7 @@ pub fn create_test_engine(
 
     if let Some(router) = router {
         let router = Mutex::new(router);
-        let cmpacted_handler = Box::new(move |event| {
+        let compacted_handler = Box::new(move |event| {
             router
                 .lock()
                 .unwrap()
@@ -544,12 +618,14 @@ pub fn create_test_engine(
                 .unwrap();
         });
         kv_db_opt.add_event_listener(CompactionListener::new(
-            cmpacted_handler,
+            compacted_handler,
             Some(dummpy_filter),
         ));
     }
 
-    let kv_cfs_opt = cfg.rocksdb.build_cf_opts(&cache);
+    let kv_cfs_opt = cfg
+        .rocksdb
+        .build_cf_opts(&cache, None, cfg.storage.enable_ttl);
 
     let engine = Arc::new(
         engine_rocks::raw_util::new_engine_opt(kv_path_str, kv_db_opt, kv_cfs_opt).unwrap(),
@@ -633,7 +709,8 @@ pub fn configure_for_lease_read<T: Simulator>(
     let election_ticks = cluster.cfg.raft_store.raft_election_timeout_ticks as u32;
     let election_timeout = base_tick_interval * election_ticks;
     // Adjust max leader lease.
-    cluster.cfg.raft_store.raft_store_max_leader_lease = ReadableDuration(election_timeout);
+    cluster.cfg.raft_store.raft_store_max_leader_lease =
+        ReadableDuration(election_timeout - base_tick_interval);
     // Use large peer check interval, abnormal and max leader missing duration to make a valid config,
     // that is election timeout x 2 < peer stale state check < abnormal < max leader missing duration.
     cluster.cfg.raft_store.peer_stale_state_check_interval = ReadableDuration(election_timeout * 3);

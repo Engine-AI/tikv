@@ -48,4 +48,39 @@ lazy_static! {
     .unwrap();
     pub static ref CDC_OLD_VALUE_CACHE_BYTES: IntGauge =
         register_int_gauge!("tikv_cdc_old_value_cache_bytes", "Bytes of old value cache").unwrap();
+    pub static ref CDC_OLD_VALUE_SCAN_DETAILS: IntCounterVec = register_int_counter_vec!(
+        "tikv_cdc_old_value_scan_details",
+        "Bucketed counter of scan details for old value",
+        &["cf", "tag"]
+    )
+    .unwrap();
+    pub static ref CDC_OLD_VALUE_DURATION_HISTOGRAM: HistogramVec = register_histogram_vec!(
+        "tikv_cdc_old_value_duration",
+        "Bucketed histogram of cdc old value scan duration",
+        &["tag"],
+        exponential_buckets(0.0001, 2.0, 20).unwrap()
+    )
+    .unwrap();
+    pub static ref CDC_SCAN_BLOCK_DURATION_HISTOGRAM: Histogram = register_histogram!(
+        "tikv_scan_block_duration",
+        "Bucketed histogram of cdc scan block duration",
+        exponential_buckets(0.005, 2.0, 20).unwrap()
+    )
+    .unwrap();
+    pub static ref CDC_SINK_QUEUE_SIZE_HISTOGRAM: Histogram = register_histogram!(
+        "tikv_cdc_sink_queue_size",
+        "Bucketed histogram of cdc sink queue size",
+        exponential_buckets(1.0, 2.0, 20).unwrap()
+    )
+    .unwrap();
+    pub static ref CDC_GRPC_WRITE_RESOLVED_TS: IntGauge = register_int_gauge!(
+        "tikv_cdc_grpc_write_resolved_ts",
+        "The latest resolved ts written to the grpc stream"
+    )
+    .unwrap();
+    pub static ref CDC_RESOLVED_TS_ADVANCE_METHOD: IntGauge = register_int_gauge!(
+        "tikv_cdc_resolved_ts_advance_method",
+        "Resolved Ts advance method, 0 = advanced through raft command, 1 = advanced through store RPC"
+    )
+    .unwrap();
 }

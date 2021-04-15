@@ -1,9 +1,12 @@
+// Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
+
 use std::{fs, io::Write, path::Path};
 
 use error_code::*;
 
 fn main() {
     let err_codes = vec![
+        cloud::ALL_ERROR_CODES.iter(),
         codec::ALL_ERROR_CODES.iter(),
         coprocessor::ALL_ERROR_CODES.iter(),
         encryption::ALL_ERROR_CODES.iter(),
@@ -19,10 +22,7 @@ fn main() {
     err_codes
         .into_iter()
         .flatten()
-        .map(|c| {
-            let s = toml::to_string_pretty(c).unwrap();
-            format!("[error.{}]\n{}\n", c.code, s.as_str())
-        })
+        .map(|c| format!("[\"{}\"]\nerror = '''\n{}\n'''\n\n", c.code, c.code))
         .for_each(|s| {
             f.write_all(s.as_bytes()).unwrap();
         });

@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 
 use chrono::DateTime;
-use futures03::stream::{self, Stream};
+use futures::stream::{self, Stream};
 use itertools::Itertools;
 use kvproto::diagnosticspb::{LogLevel, LogMessage, SearchLogRequest, SearchLogResponse};
 use lazy_static::lazy_static;
@@ -69,7 +69,7 @@ impl LogIterator {
                 return Err(Error::SearchError(format!(
                     "Illegal file name: {:?}",
                     log_path
-                )))
+                )));
             }
         };
         if log_name.is_empty() {
@@ -81,7 +81,7 @@ impl LogIterator {
                 return Err(Error::SearchError(format!(
                     "Illegal parent dir: {:?}",
                     log_path
-                )))
+                )));
             }
         };
 
@@ -342,8 +342,8 @@ pub fn search<P: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures03::executor::block_on;
-    use futures03::stream::StreamExt;
+    use futures::executor::block_on;
+    use futures::stream::StreamExt;
     use std::io::Write;
     use tempfile::tempdir;
 
@@ -460,7 +460,6 @@ mod tests {
                 LogLevel::Critical,
                 "[foo.rs:100] [some message] [key=val]",
             ),
-
             (
                 "[2019/08/23 18:09:52.387 +08:00] [TRACE] [foo.rs:100] [some message] [key=val]",
                 "2019/08/23 18:09:52.387 +08:00",
@@ -763,7 +762,7 @@ Some invalid logs 2: Welcome to TiKV - test-filter"#
         let mut req = SearchLogRequest::default();
         req.set_start_time(timestamp("2019/08/23 18:09:54.387 +08:00"));
         req.set_end_time(std::i64::MAX);
-        req.set_levels(vec![LogLevel::Warn.into()].into());
+        req.set_levels(vec![LogLevel::Warn as _]);
         req.set_patterns(vec![".*test-filter.*".to_string()].into());
         let expected = vec![
             "2019/08/23 18:09:58.387 +08:00",

@@ -4,14 +4,15 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use futures::{Future, Sink, Stream};
+use futures::{future, SinkExt, StreamExt, TryFutureExt, TryStreamExt};
 use grpcio::{
-    DuplexSink, EnvBuilder, RequestStream, RpcContext, RpcStatus, RpcStatusCode,
-    Server as GrpcServer, ServerBuilder, UnarySink, WriteFlags,
+    DuplexSink, EnvBuilder, RequestStream, Result as GrpcResult, RpcContext, RpcStatus,
+    RpcStatusCode, Server as GrpcServer, ServerBuilder, UnarySink, WriteFlags,
 };
 use pd_client::Error as PdError;
 use security::*;
 
+use fail::fail_point;
 use kvproto::pdpb::*;
 
 use super::mocker::*;
@@ -92,7 +93,10 @@ impl<C: PdMocker + Send + Sync + 'static> Server<C> {
     }
 
     pub fn stop(&mut self) {
-        self.server.take();
+        self.server
+            .take()
+            .expect("Server is not started")
+            .shutdown();
     }
 
     pub fn bind_addrs(&self) -> Vec<(String, u16)> {
@@ -105,6 +109,7 @@ impl<C: PdMocker + Send + Sync + 'static> Server<C> {
     }
 }
 
+#[allow(unused_mut)]
 fn hijack_unary<F, R, C: PdMocker>(
     mock: &mut PdMock<C>,
     ctx: RpcContext<'_>,
@@ -119,27 +124,39 @@ fn hijack_unary<F, R, C: PdMocker>(
         .as_ref()
         .and_then(|case| f(case.as_ref()))
         .or_else(|| f(mock.default_handler.as_ref()));
-
     match resp {
         Some(Ok(resp)) => ctx.spawn(
             sink.success(resp)
-                .map_err(move |err| error!("failed to reply: {:?}", err)),
+                .unwrap_or_else(|e| error!("failed to reply: {:?}", e)),
         ),
         Some(Err(err)) => {
             let status = RpcStatus::new(RpcStatusCode::UNKNOWN, Some(format!("{:?}", err)));
             ctx.spawn(
                 sink.fail(status)
-                    .map_err(move |err| error!("failed to reply: {:?}", err)),
+                    .unwrap_or_else(|e| error!("failed to reply: {:?}", e)),
             );
         }
-        _ => {
-            let status = RpcStatus::new(
+        None => {
+            let mut status = RpcStatus::new(
                 RpcStatusCode::UNIMPLEMENTED,
                 Some("Unimplemented".to_owned()),
             );
+            #[allow(clippy::redundant_closure_call)]
+            (|| {
+                fail_point!("connect_leader", |_| {
+                    let key = ctx.request_headers().get(0).unwrap();
+                    // The default option has a metadata named "user-agent" so we check the key here.
+                    let v = if key.0 == "pd-forwarded-host" {
+                        std::str::from_utf8(key.1).unwrap()
+                    } else {
+                        ""
+                    };
+                    status = RpcStatus::new(RpcStatusCode::UNAVAILABLE, Some(v.to_string()));
+                })
+            })();
             ctx.spawn(
                 sink.fail(status)
-                    .map_err(move |err| error!("failed to reply: {:?}", err)),
+                    .unwrap_or_else(|e| error!("failed to reply: {:?}", e)),
             );
         }
     }
@@ -174,18 +191,20 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
         &mut self,
         ctx: RpcContext<'_>,
         req: RequestStream<TsoRequest>,
-        resp: DuplexSink<TsoResponse>,
+        mut resp: DuplexSink<TsoResponse>,
     ) {
         let header = Service::header();
-        let fut = resp
-            .send_all(req.map(move |_| {
+        let fut = async move {
+            resp.send_all(&mut req.map(move |_| {
                 let mut r = TsoResponse::default();
                 r.set_header(header.clone());
                 r.mut_timestamp().physical = 42;
-                (r, WriteFlags::default())
+                GrpcResult::Ok((r, WriteFlags::default()))
             }))
-            .map_err(|_| ())
-            .map(|_| ());
+            .await
+            .unwrap();
+            resp.close().await.unwrap();
+        };
         ctx.spawn(fut);
     }
 
@@ -259,28 +278,23 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
         sink: DuplexSink<RegionHeartbeatResponse>,
     ) {
         let mock = self.clone();
-        let f = sink
-            .sink_map_err(PdError::from)
-            .send_all(
-                stream
-                    .map_err(PdError::from)
-                    .and_then(move |req| {
-                        let resp = mock
-                            .case
-                            .as_ref()
-                            .and_then(|case| case.region_heartbeat(&req))
-                            .or_else(|| mock.default_handler.region_heartbeat(&req));
-                        match resp {
-                            None => Ok(None),
-                            Some(Ok(resp)) => Ok(Some((resp, WriteFlags::default()))),
-                            Some(Err(e)) => Err(box_err!("{:?}", e)),
-                        }
-                    })
-                    .filter_map(|o| o),
-            )
-            .map(|_| ())
-            .map_err(|e| error!("failed to handle heartbeat: {:?}", e));
-        ctx.spawn(f)
+        ctx.spawn(async move {
+            let mut stream = stream.map_err(PdError::from).try_filter_map(move |req| {
+                let resp = mock
+                    .case
+                    .as_ref()
+                    .and_then(|case| case.region_heartbeat(&req))
+                    .or_else(|| mock.default_handler.region_heartbeat(&req));
+                match resp {
+                    None => future::ok(None),
+                    Some(Ok(resp)) => future::ok(Some((resp, WriteFlags::default()))),
+                    Some(Err(e)) => future::err(box_err!("{:?}", e)),
+                }
+            });
+            let mut sink = sink.sink_map_err(PdError::from);
+            let _ = sink.send_all(&mut stream).await;
+            let _ = sink.close().await;
+        });
     }
 
     fn get_region(
@@ -423,6 +437,33 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
         _ctx: RpcContext<'_>,
         _req: UpdateServiceGcSafePointRequest,
         _sink: UnarySink<UpdateServiceGcSafePointResponse>,
+    ) {
+        unimplemented!()
+    }
+
+    fn sync_max_ts(
+        &mut self,
+        _ctx: RpcContext<'_>,
+        _req: SyncMaxTsRequest,
+        _sink: UnarySink<SyncMaxTsResponse>,
+    ) {
+        unimplemented!()
+    }
+
+    fn split_regions(
+        &mut self,
+        _: grpcio::RpcContext<'_>,
+        _: kvproto::pdpb::SplitRegionsRequest,
+        _: grpcio::UnarySink<kvproto::pdpb::SplitRegionsResponse>,
+    ) {
+        unimplemented!()
+    }
+
+    fn get_dc_location_info(
+        &mut self,
+        _: grpcio::RpcContext<'_>,
+        _: kvproto::pdpb::GetDcLocationInfoRequest,
+        _: grpcio::UnarySink<kvproto::pdpb::GetDcLocationInfoResponse>,
     ) {
         unimplemented!()
     }

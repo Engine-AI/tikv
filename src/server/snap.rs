@@ -1,26 +1,27 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::fmt::{self, Display, Formatter};
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures03::compat::{Future01CompatExt, Sink01CompatExt, Stream01CompatExt};
-use futures03::future::{Future, TryFutureExt};
-use futures03::sink::SinkExt;
-use futures03::stream::{Stream, StreamExt, TryStreamExt};
-use futures03::task::{Context, Poll};
+use futures::future::{Future, TryFutureExt};
+use futures::sink::SinkExt;
+use futures::stream::{Stream, StreamExt, TryStreamExt};
+use futures::task::{Context, Poll};
 use grpcio::{
     ChannelBuilder, ClientStreamingSink, Environment, RequestStream, RpcStatus, RpcStatusCode,
     WriteFlags,
 };
-use kvproto::raft_serverpb::RaftMessage;
-use kvproto::raft_serverpb::{Done, SnapshotChunk};
+use kvproto::raft_serverpb::{Done, RaftMessage, RaftSnapshotData, SnapshotChunk};
 use kvproto::tikvpb::TikvClient;
+use protobuf::Message;
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
-use engine_rocks::RocksEngine;
+use engine_traits::KvEngine;
+use file_system::{IOType, WithIOType};
 use raftstore::router::RaftStoreRouter;
 use raftstore::store::{GenericSnapshot, SnapEntry, SnapKey, SnapManager};
 use security::SecurityManager;
@@ -154,10 +155,10 @@ fn send_snap(
     let (sink, receiver) = client.snapshot()?;
 
     let send_task = async move {
-        let mut sink = sink.sink_compat().sink_map_err(Error::from);
+        let mut sink = sink.sink_map_err(Error::from);
         sink.send_all(&mut chunks).await?;
         sink.close().await?;
-        let recv_result = receiver.compat().map_err(Error::from).await;
+        let recv_result = receiver.map_err(Error::from).await;
         send_timer.observe_duration();
         drop(deregister);
         drop(client);
@@ -184,6 +185,7 @@ struct RecvSnapContext {
     key: SnapKey,
     file: Option<Box<dyn GenericSnapshot>>,
     raft_msg: RaftMessage,
+    _with_io_type: WithIOType,
 }
 
 impl RecvSnapContext {
@@ -200,8 +202,16 @@ impl RecvSnapContext {
             Err(e) => return Err(box_err!("failed to create snap key: {:?}", e)),
         };
 
+        let data = meta.get_message().get_snapshot().get_data();
+        let mut snapshot = RaftSnapshotData::default();
+        snapshot.merge_from_bytes(data)?;
+        let with_io_type = WithIOType::new(if snapshot.get_meta().get_for_balance() {
+            IOType::LoadBalance
+        } else {
+            IOType::Replication
+        });
+
         let snap = {
-            let data = meta.get_message().get_snapshot().get_data();
             let s = match snap_mgr.get_snapshot_for_receiving(&key, data) {
                 Ok(s) => s,
                 Err(e) => return Err(box_err!("{} failed to create snapshot file: {:?}", key, e)),
@@ -220,10 +230,11 @@ impl RecvSnapContext {
             key,
             file: snap,
             raft_msg: meta,
+            _with_io_type: with_io_type,
         })
     }
 
-    fn finish<R: RaftStoreRouter<RocksEngine>>(self, raft_router: R) -> Result<()> {
+    fn finish<R: RaftStoreRouter<impl KvEngine>>(self, raft_router: R) -> Result<()> {
         let key = self.key;
         if let Some(mut file) = self.file {
             info!("saving snapshot file"; "snap_key" => %key, "file" => file.path());
@@ -240,14 +251,14 @@ impl RecvSnapContext {
     }
 }
 
-fn recv_snap<R: RaftStoreRouter<RocksEngine> + 'static>(
+fn recv_snap<R: RaftStoreRouter<impl KvEngine> + 'static>(
     stream: RequestStream<SnapshotChunk>,
     sink: ClientStreamingSink<Done>,
     snap_mgr: SnapManager,
     raft_router: R,
 ) -> impl Future<Output = Result<()>> {
     let recv_task = async move {
-        let mut stream = stream.compat().map_err(Error::from);
+        let mut stream = stream.map_err(Error::from);
         let head = stream.next().await.transpose()?;
         let mut context = RecvSnapContext::new(head, &snap_mgr)?;
         if context.file.is_none() {
@@ -277,20 +288,20 @@ fn recv_snap<R: RaftStoreRouter<RocksEngine> + 'static>(
 
     async move {
         match recv_task.await {
-            Ok(()) => sink
-                .success(Done::default())
-                .compat()
-                .await
-                .map_err(Error::from),
+            Ok(()) => sink.success(Done::default()).await.map_err(Error::from),
             Err(e) => {
                 let status = RpcStatus::new(RpcStatusCode::UNKNOWN, Some(format!("{:?}", e)));
-                sink.fail(status).compat().await.map_err(Error::from)
+                sink.fail(status).await.map_err(Error::from)
             }
         }
     }
 }
 
-pub struct Runner<R: RaftStoreRouter<RocksEngine> + 'static> {
+pub struct Runner<E, R>
+where
+    E: KvEngine,
+    R: RaftStoreRouter<E> + 'static,
+{
     env: Arc<Environment>,
     snap_mgr: SnapManager,
     pool: Runtime,
@@ -299,16 +310,21 @@ pub struct Runner<R: RaftStoreRouter<RocksEngine> + 'static> {
     cfg: Arc<Config>,
     sending_count: Arc<AtomicUsize>,
     recving_count: Arc<AtomicUsize>,
+    engine: PhantomData<E>,
 }
 
-impl<R: RaftStoreRouter<RocksEngine> + 'static> Runner<R> {
+impl<E, R> Runner<E, R>
+where
+    E: KvEngine,
+    R: RaftStoreRouter<E> + 'static,
+{
     pub fn new(
         env: Arc<Environment>,
         snap_mgr: SnapManager,
         r: R,
         security_mgr: Arc<SecurityManager>,
         cfg: Arc<Config>,
-    ) -> Runner<R> {
+    ) -> Runner<E, R> {
         Runner {
             env,
             snap_mgr,
@@ -316,8 +332,8 @@ impl<R: RaftStoreRouter<RocksEngine> + 'static> Runner<R> {
                 .threaded_scheduler()
                 .thread_name(thd_name!("snap-sender"))
                 .core_threads(DEFAULT_POOL_SIZE)
-                .on_thread_start(|| tikv_alloc::add_thread_memory_accessor())
-                .on_thread_stop(|| tikv_alloc::remove_thread_memory_accessor())
+                .on_thread_start(tikv_alloc::add_thread_memory_accessor)
+                .on_thread_stop(tikv_alloc::remove_thread_memory_accessor)
                 .build()
                 .unwrap(),
             raft_router: r,
@@ -325,11 +341,16 @@ impl<R: RaftStoreRouter<RocksEngine> + 'static> Runner<R> {
             cfg,
             sending_count: Arc::new(AtomicUsize::new(0)),
             recving_count: Arc::new(AtomicUsize::new(0)),
+            engine: PhantomData,
         }
     }
 }
 
-impl<R: RaftStoreRouter<RocksEngine> + 'static> Runnable for Runner<R> {
+impl<E, R> Runnable for Runner<E, R>
+where
+    E: KvEngine,
+    R: RaftStoreRouter<E> + 'static,
+{
     type Task = Task;
 
     fn run(&mut self, task: Task) {
@@ -345,7 +366,7 @@ impl<R: RaftStoreRouter<RocksEngine> + 'static> Runnable for Runner<R> {
                             task_num, self.cfg.concurrent_recv_snap_limit
                         )),
                     );
-                    self.pool.spawn(sink.fail(status).compat());
+                    self.pool.spawn(sink.fail(status));
                     return;
                 }
                 SNAP_TASK_COUNTER_STATIC.recv.inc();

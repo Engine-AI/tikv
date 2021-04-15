@@ -1,14 +1,16 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::server::Error;
-use futures03::compat::{Compat, Future01CompatExt, Sink01CompatExt};
-use futures03::future::{FutureExt, TryFutureExt};
-use futures03::sink::SinkExt;
-use futures03::stream::StreamExt;
-use grpcio::{RpcContext, RpcStatus, RpcStatusCode, ServerStreamingSink, UnarySink, WriteFlags};
+use futures::compat::Future01CompatExt;
+use futures::future::{FutureExt, TryFutureExt};
+use futures::sink::SinkExt;
+use futures::stream::StreamExt;
+use grpcio::{
+    Result as GrpcResult, RpcContext, RpcStatus, RpcStatusCode, ServerStreamingSink, UnarySink,
+    WriteFlags,
+};
 use kvproto::diagnosticspb::{
     Diagnostics, SearchLogRequest, SearchLogResponse, ServerInfoRequest, ServerInfoResponse,
     ServerInfoType,
@@ -20,9 +22,10 @@ use kvproto::diagnosticspb::search_log_request::Target as SearchLogRequestTarget
 #[cfg(not(feature = "prost-codec"))]
 use kvproto::diagnosticspb::SearchLogRequestTarget;
 
-use security::{check_common_name, SecurityManager};
-use sysinfo::SystemExt;
-use tikv_util::timer::GLOBAL_TIMER_HANDLE;
+use tikv_util::{
+    sys::{SystemExt, SYS_INFO},
+    timer::GLOBAL_TIMER_HANDLE,
+};
 
 mod ioload;
 mod log;
@@ -34,21 +37,14 @@ pub struct Service {
     pool: Handle,
     log_file: String,
     slow_log_file: String,
-    security_mgr: Arc<SecurityManager>,
 }
 
 impl Service {
-    pub fn new(
-        pool: Handle,
-        log_file: String,
-        slow_log_file: String,
-        security_mgr: Arc<SecurityManager>,
-    ) -> Self {
+    pub fn new(pool: Handle, log_file: String, slow_log_file: String) -> Self {
         Service {
             pool,
             log_file,
             slow_log_file,
-            security_mgr,
         }
     }
 }
@@ -58,11 +54,8 @@ impl Diagnostics for Service {
         &mut self,
         ctx: RpcContext<'_>,
         req: SearchLogRequest,
-        sink: ServerStreamingSink<SearchLogResponse>,
+        mut sink: ServerStreamingSink<SearchLogResponse>,
     ) {
-        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
-            return;
-        }
         let log_file = if req.get_target() == SearchLogRequestTarget::Normal {
             self.log_file.to_owned()
         } else {
@@ -85,10 +78,12 @@ impl Diagnostics for Service {
             .spawn(async move {
                 match stream.await.unwrap() {
                     Ok(s) => {
-                        let res = sink
-                            .sink_compat()
-                            .send_all(&mut s.map(|item| Ok(item)))
-                            .await;
+                        let res = async move {
+                            sink.send_all(&mut s.map(Ok)).await?;
+                            sink.close().await?;
+                            GrpcResult::Ok(())
+                        }
+                        .await;
                         if let Err(e) = res {
                             error!("search log RPC error"; "error" => ?e);
                         }
@@ -100,7 +95,7 @@ impl Diagnostics for Service {
             })
             .map(|res| res.unwrap());
 
-        ctx.spawn(Compat::new(f.unit_error().boxed()));
+        ctx.spawn(f);
     }
 
     fn server_info(
@@ -109,15 +104,12 @@ impl Diagnostics for Service {
         req: ServerInfoRequest,
         sink: UnarySink<ServerInfoResponse>,
     ) {
-        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
-            return;
-        }
         let tp = req.get_tp();
 
         let collect = async move {
             let (load, when) = match tp {
                 ServerInfoType::LoadInfo | ServerInfoType::All => {
-                    let mut system = sysinfo::System::new();
+                    let mut system = SYS_INFO.lock().unwrap();
                     system.refresh_networks_list();
                     system.refresh_all();
                     let load = (
@@ -158,16 +150,12 @@ impl Diagnostics for Service {
         };
 
         let f = self.pool.spawn(collect).then(|res| async move {
-            let res = sink
-                .success(res.unwrap())
-                .compat()
-                .map_err(Error::from)
-                .await;
+            let res = sink.success(res.unwrap()).map_err(Error::from).await;
             if let Err(e) = res {
                 debug!("Diagnostics rpc failed"; "err" => ?e);
             }
         });
 
-        ctx.spawn(Compat::new(f.unit_error().boxed()));
+        ctx.spawn(f);
     }
 }

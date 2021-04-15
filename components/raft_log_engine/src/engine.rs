@@ -8,8 +8,7 @@ use kvproto::raft_serverpb::RaftLocalState;
 use raft::eraftpb::Entry;
 use raft_engine::{EntryExt, Error as RaftEngineError, LogBatch, RaftLogEngine as RawRaftEngine};
 
-pub use raft_engine::config::RecoveryMode;
-pub use raft_engine::Config as RaftEngineConfig;
+pub use raft_engine::{Config as RaftEngineConfig, RecoveryMode};
 
 #[derive(Clone)]
 pub struct EntryExtTyped;
@@ -54,9 +53,10 @@ impl RaftLogBatchTrait for RaftLogBatch {
     }
 
     fn put_raft_state(&mut self, raft_group_id: u64, state: &RaftLocalState) -> Result<()> {
-        box_try!(self
-            .0
-            .put_msg(raft_group_id, RAFT_LOG_STATE_KEY.to_vec(), state));
+        box_try!(
+            self.0
+                .put_msg(raft_group_id, RAFT_LOG_STATE_KEY.to_vec(), state)
+        );
         Ok(())
     }
 
@@ -85,7 +85,7 @@ impl RaftEngine for RaftLogEngine {
     fn get_entry(&self, raft_group_id: u64, index: u64) -> Result<Option<Entry>> {
         self.0
             .get_entry(raft_group_id, index)
-            .map_err(|e| transfer_error(e))
+            .map_err(transfer_error)
     }
 
     fn fetch_entries_to(
@@ -98,7 +98,7 @@ impl RaftEngine for RaftLogEngine {
     ) -> Result<usize> {
         self.0
             .fetch_entries_to(raft_group_id, begin, end, max_size, to)
-            .map_err(|e| transfer_error(e))
+            .map_err(transfer_error)
     }
 
     fn consume(&self, batch: &mut Self::LogBatch, sync: bool) -> Result<usize> {
@@ -157,7 +157,7 @@ impl RaftEngine for RaftLogEngine {
     }
     /// Flush current cache stats.
     fn flush_stats(&self) -> Option<CacheStats> {
-        let stat = self.0.flush_stats();
+        let stat = self.0.flush_cache_stats();
         Some(engine_traits::CacheStats {
             hit: stat.hit,
             miss: stat.miss,

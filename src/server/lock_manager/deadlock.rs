@@ -7,12 +7,11 @@ use super::waiter_manager::Scheduler as WaiterMgrScheduler;
 use super::{Error, Result};
 use crate::server::resolve::StoreAddrResolver;
 use crate::storage::lock_manager::Lock;
+use collections::{HashMap, HashSet};
 use engine_rocks::RocksEngine;
-use futures::Future;
-use futures03::compat::{Compat, Future01CompatExt, Sink01CompatExt, Stream01CompatExt};
-use futures03::future::{self, TryFutureExt};
-use futures03::sink::SinkExt;
-use futures03::stream::{StreamExt, TryStreamExt};
+use futures::future::{self, FutureExt, TryFutureExt};
+use futures::sink::SinkExt;
+use futures::stream::TryStreamExt;
 use grpcio::{
     self, DuplexSink, Environment, RequestStream, RpcContext, RpcStatus, RpcStatusCode, UnarySink,
     WriteFlags,
@@ -26,12 +25,11 @@ use raftstore::coprocessor::{
     RegionChangeEvent, RegionChangeObserver, RoleObserver,
 };
 use raftstore::store::util::is_region_initialized;
-use security::{check_common_name, SecurityManager};
+use security::SecurityManager;
 use std::cell::RefCell;
 use std::fmt::{self, Display, Formatter};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use tikv_util::collections::{HashMap, HashSet};
 use tikv_util::future::paired_future_callback;
 use tikv_util::time::{Duration, Instant};
 use tikv_util::worker::{FutureRunnable, FutureScheduler, Stopped};
@@ -753,68 +751,57 @@ where
                 RpcStatusCode::FAILED_PRECONDITION,
                 Some("I'm not the leader of deadlock detector".to_string()),
             );
-            spawn_local(sink.fail(status).compat().map_err(|_| ()));
+            spawn_local(sink.fail(status).map_err(|_| ()));
             ERROR_COUNTER_METRICS.not_leader.inc();
             return;
         }
 
         let inner = Rc::clone(&self.inner);
-        let mut s = stream
-            .compat()
-            .map_err(Error::Grpc)
-            .filter_map(move |item| {
-                if let Ok(mut req) = item {
-                    // It's possible the leader changes after registering this handler.
-                    let mut inner = inner.borrow_mut();
-                    if inner.role != Role::Leader {
-                        ERROR_COUNTER_METRICS.not_leader.inc();
-                        return future::ready(Some(Err(Error::Other(box_err!("leader changed")))));
+        let mut s = stream.map_err(Error::Grpc).try_filter_map(move |mut req| {
+            // It's possible the leader changes after registering this handler.
+            let mut inner = inner.borrow_mut();
+            if inner.role != Role::Leader {
+                ERROR_COUNTER_METRICS.not_leader.inc();
+                return future::ready(Err(Error::Other(box_err!("leader changed"))));
+            }
+            let WaitForEntry {
+                txn,
+                wait_for_txn,
+                key_hash,
+                ..
+            } = req.get_entry();
+            let detect_table = &mut inner.detect_table;
+            let res = match req.get_tp() {
+                DeadlockRequestType::Detect => {
+                    if let Some(deadlock_key_hash) =
+                        detect_table.detect(txn.into(), wait_for_txn.into(), *key_hash)
+                    {
+                        let mut resp = DeadlockResponse::default();
+                        resp.set_entry(req.take_entry());
+                        resp.set_deadlock_key_hash(deadlock_key_hash);
+                        Some((resp, WriteFlags::default()))
+                    } else {
+                        None
                     }
-                    let WaitForEntry {
-                        txn,
-                        wait_for_txn,
-                        key_hash,
-                        ..
-                    } = req.get_entry();
-                    let detect_table = &mut inner.detect_table;
-                    let res = match req.get_tp() {
-                        DeadlockRequestType::Detect => {
-                            if let Some(deadlock_key_hash) =
-                                detect_table.detect(txn.into(), wait_for_txn.into(), *key_hash)
-                            {
-                                let mut resp = DeadlockResponse::default();
-                                resp.set_entry(req.take_entry());
-                                resp.set_deadlock_key_hash(deadlock_key_hash);
-                                Some(Ok((resp, WriteFlags::default())))
-                            } else {
-                                None
-                            }
-                        }
-                        DeadlockRequestType::CleanUpWaitFor => {
-                            detect_table.clean_up_wait_for(
-                                txn.into(),
-                                wait_for_txn.into(),
-                                *key_hash,
-                            );
-                            None
-                        }
-                        DeadlockRequestType::CleanUp => {
-                            detect_table.clean_up(txn.into());
-                            None
-                        }
-                    };
-                    future::ready(res)
-                } else {
-                    future::ready(None)
                 }
-            });
+                DeadlockRequestType::CleanUpWaitFor => {
+                    detect_table.clean_up_wait_for(txn.into(), wait_for_txn.into(), *key_hash);
+                    None
+                }
+                DeadlockRequestType::CleanUp => {
+                    detect_table.clean_up(txn.into());
+                    None
+                }
+            };
+            future::ok(res)
+        });
         let send_task = async move {
-            let _ = sink
-                .sink_compat()
-                .sink_map_err(Error::Grpc)
-                .send_all(&mut s)
-                .await;
-        };
+            let mut sink = sink.sink_map_err(Error::from);
+            sink.send_all(&mut s).await?;
+            sink.close().await?;
+            Result::Ok(())
+        }
+        .map_err(|e| warn!("deadlock detect rpc stream disconnected"; "error" => ?e));
         spawn_local(send_task);
     }
 
@@ -857,19 +844,13 @@ where
 pub struct Service {
     waiter_mgr_scheduler: WaiterMgrScheduler,
     detector_scheduler: Scheduler,
-    security_mgr: Arc<SecurityManager>,
 }
 
 impl Service {
-    pub fn new(
-        waiter_mgr_scheduler: WaiterMgrScheduler,
-        detector_scheduler: Scheduler,
-        security_mgr: Arc<SecurityManager>,
-    ) -> Self {
+    pub fn new(waiter_mgr_scheduler: WaiterMgrScheduler, detector_scheduler: Scheduler) -> Self {
         Self {
             waiter_mgr_scheduler,
             detector_scheduler,
-            security_mgr,
         }
     }
 }
@@ -882,29 +863,23 @@ impl Deadlock for Service {
         _req: WaitForEntriesRequest,
         sink: UnarySink<WaitForEntriesResponse>,
     ) {
-        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
-            return;
-        }
         let (cb, f) = paired_future_callback();
         if !self.waiter_mgr_scheduler.dump_wait_table(cb) {
             let status = RpcStatus::new(
                 RpcStatusCode::RESOURCE_EXHAUSTED,
                 Some("waiter manager has stopped".to_owned()),
             );
-            ctx.spawn(sink.fail(status).map_err(|_| ()))
+            ctx.spawn(sink.fail(status).map(|_| ()))
         } else {
             ctx.spawn(
-                Compat::new(f)
-                    .map_err(Error::from)
-                    .map(|v| {
+                f.map_err(Error::from)
+                    .map_ok(|v| {
                         let mut resp = WaitForEntriesResponse::default();
                         resp.set_entries(v.into());
                         resp
                     })
                     .and_then(|resp| sink.success(resp).map_err(Error::Grpc))
-                    .map_err(move |e| {
-                        debug!("get_wait_for_entries failed"; "err" => ?e);
-                    }),
+                    .unwrap_or_else(|e| debug!("get_wait_for_entries failed"; "err" => ?e)),
             );
         }
     }
@@ -915,9 +890,6 @@ impl Deadlock for Service {
         stream: RequestStream<DeadlockRequest>,
         sink: DuplexSink<DeadlockResponse>,
     ) {
-        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
-            return;
-        }
         let task = Task::DetectRpc { stream, sink };
         if let Err(Stopped(Task::DetectRpc { sink, .. })) = self.detector_scheduler.0.schedule(task)
         {
@@ -925,7 +897,7 @@ impl Deadlock for Service {
                 RpcStatusCode::RESOURCE_EXHAUSTED,
                 Some("deadlock detector has stopped".to_owned()),
             );
-            ctx.spawn(sink.fail(status).map_err(|_| ()));
+            ctx.spawn(sink.fail(status).map(|_| ()));
         }
     }
 }
@@ -934,7 +906,7 @@ impl Deadlock for Service {
 pub mod tests {
     use super::*;
     use crate::server::resolve::Callback;
-    use futures03::executor::block_on;
+    use futures::executor::block_on;
     use security::SecurityConfig;
     use tikv_util::worker::FutureWorker;
 
