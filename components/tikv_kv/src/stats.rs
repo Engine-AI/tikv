@@ -2,11 +2,12 @@
 
 use std::cell::RefCell;
 
-use super::metrics::{GcKeysCF, GcKeysDetail};
 use engine_rocks::PerfContext;
 use engine_traits::{CF_DEFAULT, CF_LOCK, CF_WRITE};
 use kvproto::kvrpcpb::{ScanDetail, ScanDetailV2, ScanInfo};
 pub use raftstore::store::{FlowStatistics, FlowStatsReporter};
+
+use super::metrics::{GcKeysCF, GcKeysDetail};
 
 const STAT_PROCESSED_KEYS: &str = "processed_keys";
 const STAT_GET: &str = "get";
@@ -19,10 +20,11 @@ const STAT_NEXT_TOMBSTONE: &str = "next_tombstone";
 const STAT_PREV_TOMBSTONE: &str = "prev_tombstone";
 const STAT_SEEK_TOMBSTONE: &str = "seek_tombstone";
 const STAT_SEEK_FOR_PREV_TOMBSTONE: &str = "seek_for_prev_tombstone";
-const STAT_TTL_TOMBSTONE: &str = "ttl_tombstone";
+/// Statistics of raw value tombstone by RawKV TTL expired or logical deleted.
+const STAT_RAW_VALUE_TOMBSTONE: &str = "raw_value_tombstone";
 
 thread_local! {
-    pub static TTL_TOMBSTONE : RefCell<usize> = RefCell::new(0);
+    pub static RAW_VALUE_TOMBSTONE : RefCell<usize> = RefCell::new(0);
 }
 
 pub enum StatsKind {
@@ -37,7 +39,7 @@ pub struct StatsCollector<'a> {
     kind: StatsKind,
 
     internal_tombstone: usize,
-    ttl_tombstone: usize,
+    raw_value_tombstone: usize,
 }
 
 impl<'a> StatsCollector<'a> {
@@ -46,14 +48,15 @@ impl<'a> StatsCollector<'a> {
             stats,
             kind,
             internal_tombstone: PerfContext::get().internal_delete_skipped_count() as usize,
-            ttl_tombstone: TTL_TOMBSTONE.with(|m| *m.borrow()),
+            raw_value_tombstone: RAW_VALUE_TOMBSTONE.with(|m| *m.borrow()),
         }
     }
 }
 
 impl Drop for StatsCollector<'_> {
     fn drop(&mut self) {
-        self.stats.ttl_tombstone += TTL_TOMBSTONE.with(|m| *m.borrow()) - self.ttl_tombstone;
+        self.stats.raw_value_tombstone +=
+            RAW_VALUE_TOMBSTONE.with(|m| *m.borrow()) - self.raw_value_tombstone;
         let internal_tombstone =
             PerfContext::get().internal_delete_skipped_count() as usize - self.internal_tombstone;
         match self.kind {
@@ -96,7 +99,7 @@ pub struct CfStatistics {
     pub prev_tombstone: usize,
     pub seek_tombstone: usize,
     pub seek_for_prev_tombstone: usize,
-    pub ttl_tombstone: usize,
+    pub raw_value_tombstone: usize,
 }
 
 const STATS_COUNT: usize = 12;
@@ -120,7 +123,7 @@ impl CfStatistics {
             (STAT_PREV_TOMBSTONE, self.prev_tombstone),
             (STAT_SEEK_TOMBSTONE, self.seek_tombstone),
             (STAT_SEEK_FOR_PREV_TOMBSTONE, self.seek_for_prev_tombstone),
-            (STAT_TTL_TOMBSTONE, self.ttl_tombstone),
+            (STAT_RAW_VALUE_TOMBSTONE, self.raw_value_tombstone),
         ]
     }
 
@@ -140,7 +143,7 @@ impl CfStatistics {
                 GcKeysDetail::seek_for_prev_tombstone,
                 self.seek_for_prev_tombstone,
             ),
-            (GcKeysDetail::ttl_tombstone, self.ttl_tombstone),
+            (GcKeysDetail::raw_value_tombstone, self.raw_value_tombstone),
         ]
     }
 
@@ -159,7 +162,9 @@ impl CfStatistics {
         self.seek_for_prev_tombstone = self
             .seek_for_prev_tombstone
             .saturating_add(other.seek_for_prev_tombstone);
-        self.ttl_tombstone = self.ttl_tombstone.saturating_add(other.ttl_tombstone);
+        self.raw_value_tombstone = self
+            .raw_value_tombstone
+            .saturating_add(other.raw_value_tombstone);
     }
 
     /// Deprecated
@@ -176,6 +181,15 @@ pub struct Statistics {
     pub lock: CfStatistics,
     pub write: CfStatistics,
     pub data: CfStatistics,
+
+    // Number of bytes of user key-value pairs.
+    //
+    // A user key in mem-comparable format doesn't contain timestamp but some markers and
+    // paddings, so its size is still a little bit greater than the one at client view.
+    //
+    // Note that a value comes from either write cf (due to it's a short value) or default cf, we
+    // can't embed this `processed_size` field into `CfStatistics`.
+    pub processed_size: usize,
 }
 
 impl Statistics {
@@ -199,6 +213,7 @@ impl Statistics {
         self.lock.add(&other.lock);
         self.write.add(&other.write);
         self.data.add(&other.data);
+        self.processed_size += other.processed_size;
     }
 
     /// Deprecated
@@ -222,9 +237,22 @@ impl Statistics {
         }
     }
 
+    pub fn cf_statistics(&self, cf: &str) -> &CfStatistics {
+        if cf.is_empty() {
+            return &self.data;
+        }
+        match cf {
+            CF_DEFAULT => &self.data,
+            CF_LOCK => &self.lock,
+            CF_WRITE => &self.write,
+            _ => unreachable!(),
+        }
+    }
+
     pub fn write_scan_detail(&self, detail_v2: &mut ScanDetailV2) {
         detail_v2.set_processed_versions(self.write.processed_keys as u64);
         detail_v2.set_total_versions(self.write.total_op_count() as u64);
+        detail_v2.set_processed_versions_size(self.processed_size as u64);
     }
 }
 
@@ -239,4 +267,24 @@ impl StatisticsSummary {
         self.stat.add(v);
         self.count += 1;
     }
+}
+
+/// Latency indicators for multi-execution-stages.
+///
+/// The detailed meaning of the indicators is as follows:
+///
+/// ```text
+/// ------> Begin ------> Scheduled ------> SnapshotReceived ------> Finished ------>
+/// |----- schedule_wait_time -----|
+///                                |-- snapshot_wait_time --|
+/// |------------------- wait_wall_time --------------------|
+///                                                         |-- process_wall_time --|
+/// |------------------------------ kv_read_wall_time ------------------------------|
+/// ```
+#[derive(Debug, Default, Copy, Clone)]
+pub struct StageLatencyStats {
+    pub schedule_wait_time_ns: u64,
+    pub snapshot_wait_time_ns: u64,
+    pub wait_wall_time_ns: u64,
+    pub process_wall_time_ns: u64,
 }

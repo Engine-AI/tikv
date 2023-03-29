@@ -2,15 +2,14 @@
 
 use tidb_query_codegen::AggrFunction;
 use tidb_query_common::Result;
-use tidb_query_datatype::builder::FieldTypeBuilder;
-use tidb_query_datatype::codec::data_type::*;
-use tidb_query_datatype::expr::EvalContext;
-use tidb_query_datatype::{EvalType, FieldTypeFlag, FieldTypeTp};
+use tidb_query_datatype::{
+    builder::FieldTypeBuilder, codec::data_type::*, expr::EvalContext, EvalType, FieldTypeFlag,
+    FieldTypeTp,
+};
 use tidb_query_expr::RpnExpression;
 use tipb::{Expr, ExprType, FieldType};
 
-use super::summable::Summable;
-use super::*;
+use super::{summable::Summable, *};
 
 /// A trait for VARIANCE aggregation functions
 pub trait VarianceType: Clone + std::fmt::Debug + Send + Sync + 'static {
@@ -73,6 +72,7 @@ impl<V: VarianceType> super::AggrDefinitionParser for AggrFnDefinitionParserVari
         out_exp: &mut Vec<RpnExpression>,
     ) -> Result<Box<dyn AggrFunction>> {
         use std::convert::TryFrom;
+
         use tidb_query_datatype::FieldTypeAccessor;
 
         assert!(V::check_expr_type(root_expr.get_tp()));
@@ -80,7 +80,8 @@ impl<V: VarianceType> super::AggrDefinitionParser for AggrFnDefinitionParserVari
         let out_ft = root_expr.take_field_type();
         let out_et = box_try!(EvalType::try_from(out_ft.as_accessor().tp()));
 
-        // Rewrite expression to insert CAST() if needed. The rewrite should always succeed.
+        // Rewrite expression to insert CAST() if needed. The rewrite should always
+        // succeed.
         super::util::rewrite_exp_for_sum_avg(src_schema, &mut exp).unwrap();
 
         let rewritten_eval_type =
@@ -103,7 +104,8 @@ impl<V: VarianceType> super::AggrDefinitionParser for AggrFnDefinitionParserVari
         out_schema.push(out_ft);
         out_exp.push(exp);
 
-        // Choose a type-aware VARIANCE implementation based on the eval type after rewriting exp.
+        // Choose a type-aware VARIANCE implementation based on the eval type after
+        // rewriting exp.
         Ok(match rewritten_eval_type {
             EvalType::Decimal => Box::new(AggrFnVariance::<Decimal, V>::new()),
             EvalType::Real => Box::new(AggrFnVariance::<Real, V>::new()),
@@ -117,7 +119,8 @@ impl<V: VarianceType> super::AggrDefinitionParser for AggrFnDefinitionParserVari
 
 /// The VARIANCE aggregate function.
 ///
-/// Note that there are `VARIANCE(Decimal) -> Decimal` and `VARIANCE(Double) -> Double`.
+/// Note that there are `VARIANCE(Decimal) -> Decimal` and `VARIANCE(Double) ->
+/// Double`.
 #[derive(Debug, AggrFunction)]
 #[aggr_function(state = AggrFnStateVariance::<T, V>::new())]
 pub struct AggrFnVariance<T, V>
@@ -276,13 +279,13 @@ where
 
     /// # Notes
     ///
-    /// Functions such as SUM() or AVG() or VARIANCE() that expect a numeric argument cast the
-    /// argument to a number if necessary. For ENUM values, the index number is used in the
-    /// calculation.
+    /// Functions such as SUM() or AVG() or VARIANCE() that expect a numeric
+    /// argument cast the argument to a number if necessary. For ENUM values,
+    /// the index number is used in the calculation.
     ///
     /// ref: https://dev.mysql.com/doc/refman/8.0/en/enum.html
     #[inline]
-    fn update_concrete(&mut self, ctx: &mut EvalContext, value: Option<EnumRef>) -> Result<()> {
+    fn update_concrete(&mut self, ctx: &mut EvalContext, value: Option<EnumRef<'_>>) -> Result<()> {
         match value {
             None => Ok(()),
             Some(value) => {
@@ -387,13 +390,13 @@ where
 
     /// # Notes
     ///
-    /// Functions such as SUM() or AVG() or VARIANCE() that expect a numeric argument cast the
-    /// argument to a number if necessary. For ENUM values, the index number is used in the
-    /// calculation.
+    /// Functions such as SUM() or AVG() or VARIANCE() that expect a numeric
+    /// argument cast the argument to a number if necessary. For ENUM values,
+    /// the index number is used in the calculation.
     ///
     /// ref: https://dev.mysql.com/doc/refman/8.0/en/enum.html
     #[inline]
-    fn update_concrete(&mut self, ctx: &mut EvalContext, value: Option<SetRef>) -> Result<()> {
+    fn update_concrete(&mut self, ctx: &mut EvalContext, value: Option<SetRef<'_>>) -> Result<()> {
         match value {
             None => Ok(()),
             Some(value) => {
@@ -451,14 +454,15 @@ where
 mod tests {
     use std::sync::Arc;
 
-    use tidb_query_datatype::codec::batch::{LazyBatchColumn, LazyBatchColumnVec};
-    use tidb_query_datatype::{FieldTypeAccessor, FieldTypeTp};
+    use tidb_query_datatype::{
+        codec::batch::{LazyBatchColumn, LazyBatchColumnVec},
+        FieldTypeAccessor, FieldTypeTp,
+    };
     use tikv_util::buffer_vec::BufferVec;
     use tipb_helper::ExprDefBuilder;
 
-    use crate::parser::AggrDefinitionParser;
-
     use super::*;
+    use crate::parser::AggrDefinitionParser;
 
     #[test]
     fn test_variance_enum() {
@@ -472,18 +476,13 @@ mod tests {
             VectorValue::with_capacity(0, EvalType::Decimal),
         ];
 
-        let mut buf = BufferVec::new();
-        buf.push("我好强啊");
-        buf.push("我太强啦");
-        let buf = Arc::new(buf);
-
         state.push_result(&mut ctx, &mut result[..]).unwrap();
         assert_eq!(result[0].to_int_vec(), &[Some(0)]);
         assert_eq!(result[1].to_decimal_vec(), &[None]);
         assert_eq!(result[2].to_decimal_vec(), &[None]);
 
-        update!(state, &mut ctx, Some(EnumRef::new(&buf, 1))).unwrap();
-        update!(state, &mut ctx, Some(EnumRef::new(&buf, 2))).unwrap();
+        update!(state, &mut ctx, Some(EnumRef::new("bbb".as_bytes(), &1))).unwrap();
+        update!(state, &mut ctx, Some(EnumRef::new("aaa".as_bytes(), &2))).unwrap();
         result[0].clear();
         result[1].clear();
         result[2].clear();
@@ -492,7 +491,7 @@ mod tests {
         assert_eq!(result[1].to_decimal_vec(), &[Decimal::from_f64(3.0).ok()]);
         assert_eq!(result[2].to_decimal_vec(), &[Decimal::from_f64(0.25).ok()]);
 
-        update!(state, &mut ctx, Option::<EnumRef>::None).unwrap();
+        update!(state, &mut ctx, Option::<EnumRef<'_>>::None).unwrap();
         result[0].clear();
         result[1].clear();
         result[2].clear();
@@ -534,7 +533,7 @@ mod tests {
         assert_eq!(result[1].to_decimal_vec(), &[Decimal::from_f64(3.0).ok()]);
         assert_eq!(result[2].to_decimal_vec(), &[Decimal::from_f64(0.25).ok()]);
 
-        update!(state, &mut ctx, Option::<SetRef>::None).unwrap();
+        update!(state, &mut ctx, Option::<SetRef<'_>>::None).unwrap();
         result[0].clear();
         result[1].clear();
         result[2].clear();
@@ -613,7 +612,7 @@ mod tests {
             update_vector!(
                 pop_var_state,
                 &mut ctx,
-                &pop_var_slice,
+                pop_var_slice,
                 pop_var_result.logical_rows()
             )
             .unwrap();
@@ -633,7 +632,7 @@ mod tests {
             update_vector!(
                 samp_var_state,
                 &mut ctx,
-                &samp_var_slice,
+                samp_var_slice,
                 samp_var_result.logical_rows()
             )
             .unwrap();

@@ -2,16 +2,16 @@
 
 use std::ffi::CString;
 
-use crate::{coprocessor::RegionInfoProvider, Error, Result};
 use engine_traits::{
     CfName, SstPartitioner, SstPartitionerContext, SstPartitionerFactory, SstPartitionerRequest,
-    SstPartitionerResult, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_VER_DEFAULT, CF_WRITE,
+    SstPartitionerResult, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE,
 };
-use keys::data_end_key;
+use keys::{data_end_key, origin_key};
 use lazy_static::lazy_static;
 use tikv_util::warn;
 
 use super::metrics::*;
+use crate::{coprocessor::RegionInfoProvider, Error, Result};
 
 const COMPACTION_GUARD_MAX_POS_SKIP: u32 = 10;
 
@@ -32,7 +32,6 @@ impl<P: RegionInfoProvider> CompactionGuardGeneratorFactory<P> {
             CF_LOCK => CfNames::lock,
             CF_WRITE => CfNames::write,
             CF_RAFT => CfNames::raft,
-            CF_VER_DEFAULT => CfNames::ver_default,
             _ => {
                 return Err(Error::Other(From::from(format!(
                     "fail to enable compaction guard, unrecognized cf name: {}",
@@ -48,8 +47,8 @@ impl<P: RegionInfoProvider> CompactionGuardGeneratorFactory<P> {
     }
 }
 
-// Update to implement engine_traits::SstPartitionerFactory instead once we move to use abstracted
-// ColumnFamilyOptions in src/config.rs.
+// Update to implement engine_traits::SstPartitionerFactory instead once we move
+// to use abstracted CfOptions in src/config.rs.
 impl<P: RegionInfoProvider + Clone + 'static> SstPartitionerFactory
     for CompactionGuardGeneratorFactory<P>
 {
@@ -59,10 +58,10 @@ impl<P: RegionInfoProvider + Clone + 'static> SstPartitionerFactory
         &COMPACTION_GUARD
     }
 
-    fn create_partitioner(&self, context: &SstPartitionerContext) -> Option<Self::Partitioner> {
-        // create_partitioner can be called in RocksDB while holding db_mutex. It can block
-        // other operations on RocksDB. To avoid such caces, we defer region info query to
-        // the first time should_partition is called.
+    fn create_partitioner(&self, context: &SstPartitionerContext<'_>) -> Option<Self::Partitioner> {
+        // create_partitioner can be called in RocksDB while holding db_mutex. It can
+        // block other operations on RocksDB. To avoid such cases, we defer
+        // region info query to the first time should_partition is called.
         Some(CompactionGuardGenerator {
             cf_name: self.cf_name,
             smallest_key: context.smallest_key.to_vec(),
@@ -92,30 +91,54 @@ pub struct CompactionGuardGenerator<P: RegionInfoProvider> {
 
 impl<P: RegionInfoProvider> CompactionGuardGenerator<P> {
     fn initialize(&mut self) {
-        self.use_guard = match self
-            .provider
-            .get_regions_in_range(&self.smallest_key, &self.largest_key)
-        {
-            Ok(regions) => {
-                // The regions returned from region_info_provider should have been sorted,
-                // but we sort it again just in case.
-                COMPACTION_GUARD_ACTION_COUNTER.get(self.cf_name).init.inc();
-                let mut boundaries = regions
-                    .iter()
-                    .map(|region| data_end_key(&region.end_key))
-                    .collect::<Vec<Vec<u8>>>();
-                boundaries.sort();
-                self.boundaries = boundaries;
-                true
+        // The range may include non-data keys which are not included in any region,
+        // such as `STORE_IDENT_KEY`, `REGION_RAFT_KEY` and `REGION_META_KEY`,
+        // so check them and get covered regions only for the range of data keys.
+        let res = match (
+            self.smallest_key.starts_with(keys::DATA_PREFIX_KEY),
+            self.largest_key.starts_with(keys::DATA_PREFIX_KEY),
+        ) {
+            (true, true) => Some((
+                origin_key(&self.smallest_key),
+                origin_key(&self.largest_key),
+            )),
+            (true, false) => Some((origin_key(&self.smallest_key), "".as_bytes())),
+            (false, true) => Some(("".as_bytes(), origin_key(&self.largest_key))),
+            (false, false) => {
+                if self.smallest_key.as_slice() < keys::DATA_MIN_KEY
+                    && self.largest_key.as_slice() >= keys::DATA_MAX_KEY
+                {
+                    Some(("".as_bytes(), "".as_bytes()))
+                } else {
+                    None
+                }
             }
-            Err(e) => {
-                COMPACTION_GUARD_ACTION_COUNTER
-                    .get(self.cf_name)
-                    .init_failure
-                    .inc();
-                warn!("failed to initialize compaction guard generator"; "err" => ?e);
-                false
+        };
+        self.use_guard = if let Some((start, end)) = res {
+            match self.provider.get_regions_in_range(start, end) {
+                Ok(regions) => {
+                    // The regions returned from region_info_provider should have been sorted,
+                    // but we sort it again just in case.
+                    COMPACTION_GUARD_ACTION_COUNTER.get(self.cf_name).init.inc();
+                    let mut boundaries = regions
+                        .iter()
+                        .map(|region| data_end_key(&region.end_key))
+                        .collect::<Vec<Vec<u8>>>();
+                    boundaries.sort();
+                    self.boundaries = boundaries;
+                    true
+                }
+                Err(e) => {
+                    COMPACTION_GUARD_ACTION_COUNTER
+                        .get(self.cf_name)
+                        .init_failure
+                        .inc();
+                    warn!("failed to initialize compaction guard generator"; "err" => ?e);
+                    false
+                }
             }
+        } else {
+            false
         };
         self.pos = 0;
         self.initialized = true;
@@ -123,7 +146,7 @@ impl<P: RegionInfoProvider> CompactionGuardGenerator<P> {
 }
 
 impl<P: RegionInfoProvider> SstPartitioner for CompactionGuardGenerator<P> {
-    fn should_partition(&mut self, req: &SstPartitionerRequest) -> SstPartitionerResult {
+    fn should_partition(&mut self, req: &SstPartitionerRequest<'_>) -> SstPartitionerResult {
         if !self.initialized {
             self.initialize();
         }
@@ -172,20 +195,67 @@ impl<P: RegionInfoProvider> SstPartitioner for CompactionGuardGenerator<P> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::coprocessor::region_info_accessor::MockRegionInfoProvider;
+    use std::str;
+
     use engine_rocks::{
-        raw::{BlockBasedOptions, ColumnFamilyOptions, DBCompressionType, DBOptions},
-        raw_util::{new_engine_opt, CFOptions},
-        RocksEngine, RocksSstPartitionerFactory, RocksSstReader,
+        raw::{BlockBasedOptions, DBCompressionType},
+        util::new_engine_opt,
+        RocksCfOptions, RocksDbOptions, RocksEngine, RocksSstPartitionerFactory, RocksSstReader,
     };
     use engine_traits::{
-        CompactExt, Iterator, MiscExt, SeekKey, SstReader, SyncMutable, CF_DEFAULT,
+        CompactExt, IterOptions, Iterator, MiscExt, RefIterable, SstReader, SyncMutable, CF_DEFAULT,
     };
     use keys::DATA_PREFIX_KEY;
     use kvproto::metapb::Region;
-    use std::{str, sync::Arc};
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::coprocessor::region_info_accessor::MockRegionInfoProvider;
+
+    #[test]
+    fn test_compaction_guard_non_data() {
+        let mut guard = CompactionGuardGenerator {
+            cf_name: CfNames::default,
+            smallest_key: vec![],
+            largest_key: vec![],
+            min_output_file_size: 8 << 20, // 8MB
+            provider: MockRegionInfoProvider::new(vec![]),
+            initialized: false,
+            use_guard: false,
+            boundaries: vec![],
+            pos: 0,
+        };
+
+        guard.smallest_key = keys::LOCAL_MIN_KEY.to_vec();
+        guard.largest_key = keys::LOCAL_MAX_KEY.to_vec();
+        guard.initialize();
+        assert_eq!(guard.use_guard, false);
+
+        guard.smallest_key = keys::LOCAL_MIN_KEY.to_vec();
+        guard.largest_key = keys::DATA_MIN_KEY.to_vec();
+        guard.initialize();
+        assert_eq!(guard.use_guard, true);
+
+        guard.smallest_key = keys::LOCAL_MIN_KEY.to_vec();
+        guard.largest_key = keys::DATA_MAX_KEY.to_vec();
+        guard.initialize();
+        assert_eq!(guard.use_guard, true);
+
+        guard.smallest_key = keys::DATA_MIN_KEY.to_vec();
+        guard.largest_key = keys::DATA_MAX_KEY.to_vec();
+        guard.initialize();
+        assert_eq!(guard.use_guard, true);
+
+        guard.smallest_key = keys::DATA_MIN_KEY.to_vec();
+        guard.largest_key = vec![keys::DATA_PREFIX + 10];
+        guard.initialize();
+        assert_eq!(guard.use_guard, true);
+
+        guard.smallest_key = keys::DATA_MAX_KEY.to_vec();
+        guard.largest_key = vec![keys::DATA_PREFIX + 10];
+        guard.initialize();
+        assert_eq!(guard.use_guard, false);
+    }
 
     #[test]
     fn test_compaction_guard_should_partition() {
@@ -299,7 +369,7 @@ mod tests {
     fn new_test_db(provider: MockRegionInfoProvider) -> (RocksEngine, TempDir) {
         let temp_dir = TempDir::new().unwrap();
 
-        let mut cf_opts = ColumnFamilyOptions::new();
+        let mut cf_opts = RocksCfOptions::default();
         cf_opts.set_target_file_size_base(MAX_OUTPUT_FILE_SIZE);
         cf_opts.set_sst_partitioner_factory(RocksSstPartitionerFactory(
             CompactionGuardGeneratorFactory::new(CF_DEFAULT, provider, MIN_OUTPUT_FILE_SIZE)
@@ -315,26 +385,25 @@ mod tests {
             DBCompressionType::No,
             DBCompressionType::No,
         ]);
-        // Make block size small to make sure current_output_file_size passed to SstPartitioner
-        // is accurate.
+        // Make block size small to make sure current_output_file_size passed to
+        // SstPartitioner is accurate.
         let mut block_based_opts = BlockBasedOptions::new();
         block_based_opts.set_block_size(100);
         cf_opts.set_block_based_table_factory(&block_based_opts);
 
-        let db = RocksEngine::from_db(Arc::new(
-            new_engine_opt(
-                temp_dir.path().to_str().unwrap(),
-                DBOptions::new(),
-                vec![CFOptions::new(CF_DEFAULT, cf_opts)],
-            )
-            .unwrap(),
-        ));
+        let db = new_engine_opt(
+            temp_dir.path().to_str().unwrap(),
+            RocksDbOptions::default(),
+            vec![(CF_DEFAULT, cf_opts)],
+        )
+        .unwrap();
         (db, temp_dir)
     }
 
     fn collect_keys(path: &str) -> Vec<Vec<u8>> {
-        let mut sst_reader = RocksSstReader::open(path).unwrap().iter();
-        let mut valid = sst_reader.seek(SeekKey::Start).unwrap();
+        let reader = RocksSstReader::open(path).unwrap();
+        let mut sst_reader = reader.iter(IterOptions::default()).unwrap();
+        let mut valid = sst_reader.seek_to_first().unwrap();
         let mut ret = vec![];
         while valid {
             ret.push(sst_reader.key().to_owned());
@@ -371,26 +440,26 @@ mod tests {
         assert_eq!(b"z", DATA_PREFIX_KEY);
 
         // Create two overlapping SST files then force compaction.
-        // Region "a" will share a SST file with region "b", since region "a" is too small.
-        // Region "c" will be splitted into two SSTs, since its size is larger than
-        // target_file_size_base.
+        // Region "a" will share a SST file with region "b", since region "a" is too
+        // small. Region "c" will be splitted into two SSTs, since its size is
+        // larger than target_file_size_base.
         let value = vec![b'v'; 1024];
         db.put(b"za1", b"").unwrap();
         db.put(b"zb1", &value).unwrap();
         db.put(b"zc1", &value).unwrap();
-        db.flush(true /*sync*/).unwrap();
+        db.flush_cfs(&[], true /* wait */).unwrap();
         db.put(b"zb2", &value).unwrap();
         db.put(b"zc2", &value).unwrap();
         db.put(b"zc3", &value).unwrap();
         db.put(b"zc4", &value).unwrap();
         db.put(b"zc5", &value).unwrap();
         db.put(b"zc6", &value).unwrap();
-        db.flush(true /*sync*/).unwrap();
-        db.compact_range(
-            CF_DEFAULT, None,  /*start_key*/
-            None,  /*end_key*/
-            false, /*exclusive_manual*/
-            1,     /*max_subcompactions*/
+        db.flush_cfs(&[], true /* wait */).unwrap();
+        db.compact_range_cf(
+            CF_DEFAULT, None,  // start_key
+            None,  // end_key
+            false, // exclusive_manual
+            1,     // max_subcompactions
         )
         .unwrap();
 

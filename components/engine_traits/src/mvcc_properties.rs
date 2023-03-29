@@ -1,6 +1,7 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::cmp;
+
 use txn_types::TimeStamp;
 
 #[derive(Clone, Debug)]
@@ -35,6 +36,12 @@ impl MvccProperties {
         self.num_deletes += other.num_deletes;
         self.num_versions += other.num_versions;
         self.max_row_versions = cmp::max(self.max_row_versions, other.max_row_versions);
+    }
+}
+
+impl Default for MvccProperties {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

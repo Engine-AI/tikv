@@ -1,31 +1,28 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
+use std::{fmt::Debug, path::Path};
 
 use async_trait::async_trait;
-use derive_more::Deref;
-use error_code::{self, ErrorCode, ErrorCodeExt};
-use std::fmt::Debug;
-use std::path::Path;
-use tikv_util::error;
-use tikv_util::impl_format_delegate_newtype;
-use tikv_util::stream::RetryError;
-
-#[cfg(feature = "aws")]
-use aws::{AwsKms, AWS_VENDOR_NAME};
-use cloud::kms::{
-    Config as CloudConfig, EncryptedKey as CloudEncryptedKey, KmsProvider as CloudKmsProvider,
+#[cfg(feature = "cloud-aws")]
+use aws::{AwsKms, STORAGE_VENDOR_NAME_AWS};
+#[cfg(feature = "cloud-aws")]
+use cloud::kms::Config as CloudConfig;
+use cloud::{
+    kms::{EncryptedKey as CloudEncryptedKey, KmsProvider as CloudKmsProvider},
+    Error as CloudError,
 };
-use cloud::Error as CloudError;
-#[cfg(feature = "aws")]
+use derive_more::Deref;
+#[cfg(feature = "cloud-aws")]
 pub use encryption::KmsBackend;
 pub use encryption::{
-    encryption_method_from_db_encryption_method, Backend, DataKeyManager, DataKeyManagerArgs,
-    DecrypterReader, EncryptionConfig, Error, FileConfig, Iv, KmsConfig, MasterKeyConfig, Result,
+    from_engine_encryption_method, Backend, DataKeyManager, DataKeyManagerArgs, DecrypterReader,
+    EncryptionConfig, Error, FileConfig, Iv, KmsConfig, MasterKeyConfig, Result,
 };
 use encryption::{
     DataKeyPair, EncryptedKey, FileBackend, KmsProvider, PlainKey, PlaintextBackend,
     RetryCodedError,
 };
-use tikv_util::box_err;
+use error_code::{self, ErrorCode, ErrorCodeExt};
+use tikv_util::{box_err, error, info, stream::RetryError};
 
 pub fn data_key_manager_from_config(
     config: &EncryptionConfig,
@@ -50,17 +47,29 @@ pub fn create_backend(config: &MasterKeyConfig) -> Result<Box<dyn Backend>> {
     result
 }
 
+fn cloud_convert_error(msg: String) -> Box<dyn FnOnce(CloudError) -> CloudConvertError> {
+    Box::new(|err: CloudError| CloudConvertError(err, msg))
+}
+
 pub fn create_cloud_backend(config: &KmsConfig) -> Result<Box<dyn Backend>> {
-    Ok(match config.vendor.as_str() {
-        #[cfg(feature = "aws")]
-        AWS_VENDOR_NAME | "" => {
-            let conf =
-                CloudConfig::from_proto(config.clone().into_proto()).map_err(CloudConvertError)?;
-            let kms_provider = CloudKms(Box::new(AwsKms::new(conf).map_err(CloudConvertError)?));
-            Box::new(KmsBackend::new(Box::new(kms_provider))?) as Box<dyn Backend>
+    info!("Encryption init cloud backend";
+        "region" => &config.region,
+        "endpoint" => &config.endpoint,
+        "key_id" => &config.key_id,
+        "vendor" => &config.vendor,
+    );
+    match config.vendor.as_str() {
+        #[cfg(feature = "cloud-aws")]
+        STORAGE_VENDOR_NAME_AWS | "" => {
+            let conf = CloudConfig::from_proto(config.clone().into_proto())
+                .map_err(cloud_convert_error("aws from proto".to_owned()))?;
+            let kms_provider = CloudKms(Box::new(
+                AwsKms::new(conf).map_err(cloud_convert_error("new AWS KMS".to_owned()))?,
+            ));
+            Ok(Box::new(KmsBackend::new(Box::new(kms_provider))?) as Box<dyn Backend>)
         }
-        provider => return Err(Error::Other(box_err!("provider not found {}", provider))),
-    })
+        provider => Err(Error::Other(box_err!("provider not found {}", provider))),
+    }
 }
 
 fn create_backend_inner(config: &MasterKeyConfig) -> Result<Box<dyn Backend>> {
@@ -73,7 +82,8 @@ fn create_backend_inner(config: &MasterKeyConfig) -> Result<Box<dyn Backend>> {
     })
 }
 
-// CloudKMS adapts the KmsProvider definition from the cloud crate to that of the encryption crate
+// CloudKMS adapts the KmsProvider definition from the cloud crate to that of
+// the encryption crate
 #[derive(Debug, Deref)]
 struct CloudKms(Box<dyn CloudKmsProvider>);
 
@@ -83,7 +93,10 @@ impl KmsProvider for CloudKms {
         let cdk = (**self)
             .generate_data_key()
             .await
-            .map_err(CloudConvertError)?;
+            .map_err(cloud_convert_error(format!(
+                "{} generate data key API",
+                self.name()
+            )))?;
         Ok(DataKeyPair {
             plaintext: PlainKey::new(cdk.plaintext.to_vec())?,
             encrypted: EncryptedKey::new(cdk.encrypted.to_vec())?,
@@ -91,26 +104,35 @@ impl KmsProvider for CloudKms {
     }
 
     async fn decrypt_data_key(&self, data_key: &EncryptedKey) -> Result<Vec<u8>> {
-        let key = CloudEncryptedKey::new((*data_key).to_vec()).map_err(CloudConvertError)?;
+        let key = CloudEncryptedKey::new((*data_key).to_vec()).map_err(cloud_convert_error(
+            format!("{} data key init for decrypt", self.name()),
+        ))?;
         Ok((**self)
             .decrypt_data_key(&key)
             .await
-            .map_err(CloudConvertError)?)
+            .map_err(cloud_convert_error(format!(
+                "{} decrypt data key API",
+                self.name()
+            )))?)
     }
 
-    fn name(&self) -> &[u8] {
+    fn name(&self) -> &str {
         (**self).name()
     }
 }
 
 // CloudConverError adapts cloud errors to encryption errors
 // As the abstract RetryCodedError
-#[derive(Debug, Deref)]
-pub struct CloudConvertError(CloudError);
+#[derive(Debug)]
+pub struct CloudConvertError(CloudError, String);
 
 impl RetryCodedError for CloudConvertError {}
 
-impl_format_delegate_newtype!(CloudConvertError);
+impl std::fmt::Display for CloudConvertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{} {}", &self.0, &self.1))
+    }
+}
 
 impl std::convert::From<CloudConvertError> for Error {
     fn from(err: CloudConvertError) -> Error {

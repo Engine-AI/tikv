@@ -1,87 +1,74 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use async_stream::stream;
-use engine_traits::KvEngine;
-use futures::compat::Compat01As03;
-use futures::executor::block_on;
-use futures::future::{ok, poll_fn};
-use futures::prelude::*;
-use hyper::client::HttpConnector;
-use hyper::server::accept::Accept;
-use hyper::server::conn::{AddrIncoming, AddrStream};
-use hyper::server::Builder as HyperBuilder;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{self, header, Body, Client, Method, Request, Response, Server, StatusCode, Uri};
-use hyper_openssl::HttpsConnector;
-use openssl::ssl::{
-    SslAcceptor, SslConnector, SslConnectorBuilder, SslFiletype, SslMethod, SslVerifyMode,
+/// Provides profilers for TiKV.
+mod profile;
+use std::{
+    error::Error as StdError,
+    net::SocketAddr,
+    path::PathBuf,
+    pin::Pin,
+    str::{self, FromStr},
+    sync::Arc,
+    task::{Context, Poll},
+    time::{Duration, Instant},
 };
-use openssl::x509::X509;
+
+use async_stream::stream;
+use collections::HashMap;
+use flate2::{write::GzEncoder, Compression};
+use futures::{
+    compat::{Compat01As03, Stream01CompatExt},
+    future::{ok, poll_fn},
+    prelude::*,
+};
+use http::header::{HeaderValue, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE};
+use hyper::{
+    self, header,
+    server::{
+        accept::Accept,
+        conn::{AddrIncoming, AddrStream},
+        Builder as HyperBuilder,
+    },
+    service::{make_service_fn, service_fn},
+    Body, Method, Request, Response, Server, StatusCode,
+};
+use kvproto::resource_manager::ResourceGroup;
+use online_config::OnlineConfig;
+use openssl::{
+    ssl::{Ssl, SslAcceptor, SslContext, SslFiletype, SslMethod, SslVerifyMode},
+    x509::X509,
+};
 use pin_project::pin_project;
-use pprof::protos::Message;
-use raftstore::store::{transport::CasualRouter, CasualMessage};
+pub use profile::{
+    activate_heap_profile, deactivate_heap_profile, jeprof_heap_profile, list_heap_profiles,
+    read_file, start_one_cpu_profile, start_one_heap_profile,
+};
+use prometheus::TEXT_FORMAT;
 use regex::Regex;
+use resource_control::ResourceGroupManager;
+use security::{self, SecurityConfig};
+use serde::Serialize;
 use serde_json::Value;
-use tempfile::TempDir;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-use tokio::runtime::{Builder, Runtime};
-use tokio::sync::oneshot::{self, Receiver, Sender};
+use tikv_kv::RaftExtension;
+use tikv_util::{
+    logger::set_log_level,
+    metrics::{dump, dump_to},
+    timer::GLOBAL_TIMER_HANDLE,
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    runtime::{Builder, Handle, Runtime},
+    sync::oneshot::{self, Receiver, Sender},
+};
 use tokio_openssl::SslStream;
 
-use std::error::Error as StdError;
-use std::marker::PhantomData;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::thread;
-use std::time::{Duration, Instant};
+use crate::{
+    config::{ConfigController, LogLevel},
+    server::Result,
+    tikv_util::sys::thread::ThreadBuildWrapper,
+};
 
-use super::Result;
-use crate::config::{log_level_serde, ConfigController};
-use collections::HashMap;
-use configuration::Configuration;
-use pd_client::{RpcClient, REQUEST_RECONNECT_INTERVAL};
-use security::{self, SecurityConfig};
-use tikv_alloc::error::ProfError;
-use tikv_util::logger::set_log_level;
-use tikv_util::metrics::dump;
-use tikv_util::timer::GLOBAL_TIMER_HANDLE;
-
-pub mod region_meta;
-
-mod profiler_guard {
-    use tikv_alloc::error::ProfResult;
-    use tikv_alloc::{activate_prof, deactivate_prof};
-
-    use tokio::sync::{Mutex, MutexGuard};
-
-    lazy_static! {
-        static ref PROFILER_MUTEX: Mutex<u32> = Mutex::new(0);
-    }
-
-    pub struct ProfGuard(MutexGuard<'static, u32>);
-
-    pub async fn new_prof() -> ProfResult<ProfGuard> {
-        let guard = PROFILER_MUTEX.lock().await;
-        match activate_prof() {
-            Ok(_) => Ok(ProfGuard(guard)),
-            Err(e) => Err(e),
-        }
-    }
-
-    impl Drop for ProfGuard {
-        fn drop(&mut self) {
-            // TODO: handle error here
-            let _ = deactivate_prof();
-        }
-    }
-}
-
-const COMPONENT_REQUEST_RETRY: usize = 5;
-
-static COMPONENT: &str = "tikv";
+static TIMER_CANCELED: &str = "tokio timer canceled";
 
 #[cfg(feature = "failpoints")]
 static MISSING_NAME: &[u8] = b"Missing param name";
@@ -92,159 +79,169 @@ static FAIL_POINTS_REQUEST_PATH: &str = "/fail";
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub struct LogLevelRequest {
-    #[serde(with = "log_level_serde")]
-    pub log_level: slog::Level,
+struct LogLevelRequest {
+    pub log_level: LogLevel,
 }
 
-pub struct StatusServer<E, R> {
+pub struct StatusServer<R> {
     thread_pool: Runtime,
     tx: Sender<()>,
     rx: Option<Receiver<()>>,
     addr: Option<SocketAddr>,
-    advertise_addr: Option<String>,
-    pd_client: Option<Arc<RpcClient>>,
     cfg_controller: ConfigController,
     router: R,
     security_config: Arc<SecurityConfig>,
-    _snap: PhantomData<E>,
+    store_path: PathBuf,
+    resource_manager: Option<Arc<ResourceGroupManager>>,
 }
 
-impl StatusServer<(), ()> {
-    fn extract_thread_name(thread_name: &str) -> String {
-        lazy_static! {
-            static ref THREAD_NAME_RE: Regex =
-                Regex::new(r"^(?P<thread_name>[a-z-_ :]+?)(-?\d)*$").unwrap();
-            static ref THREAD_NAME_REPLACE_SEPERATOR_RE: Regex = Regex::new(r"[_ ]").unwrap();
-        }
-
-        THREAD_NAME_RE
-            .captures(thread_name)
-            .and_then(|cap| {
-                cap.name("thread_name").map(|thread_name| {
-                    THREAD_NAME_REPLACE_SEPERATOR_RE
-                        .replace_all(thread_name.as_str(), "-")
-                        .into_owned()
-                })
-            })
-            .unwrap_or_else(|| thread_name.to_owned())
-    }
-
-    fn frames_post_processor() -> impl Fn(&mut pprof::Frames) {
-        move |frames| {
-            let name = Self::extract_thread_name(&frames.thread_name);
-            frames.thread_name = name;
-        }
-    }
-
-    fn err_response<T>(status_code: StatusCode, message: T) -> Response<Body>
-    where
-        T: Into<Body>,
-    {
-        Response::builder()
-            .status(status_code)
-            .body(message.into())
-            .unwrap()
-    }
-}
-
-impl<E, R> StatusServer<E, R>
+impl<R> StatusServer<R>
 where
-    E: 'static,
     R: 'static + Send,
 {
     pub fn new(
         status_thread_pool_size: usize,
-        pd_client: Option<Arc<RpcClient>>,
         cfg_controller: ConfigController,
         security_config: Arc<SecurityConfig>,
         router: R,
+        store_path: PathBuf,
+        resource_manager: Option<Arc<ResourceGroupManager>>,
     ) -> Result<Self> {
-        let thread_pool = Builder::new()
-            .threaded_scheduler()
+        let thread_pool = Builder::new_multi_thread()
             .enable_all()
-            .core_threads(status_thread_pool_size)
+            .worker_threads(status_thread_pool_size)
             .thread_name("status-server")
-            .on_thread_start(|| {
-                debug!("Status server started");
-            })
-            .on_thread_stop(|| {
-                debug!("stopping status server");
-            })
+            .after_start_wrapper(|| debug!("Status server started"))
+            .before_stop_wrapper(|| debug!("stopping status server"))
             .build()?;
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+        let (tx, rx) = oneshot::channel::<()>();
         Ok(StatusServer {
             thread_pool,
             tx,
             rx: Some(rx),
             addr: None,
-            advertise_addr: None,
-            pd_client,
             cfg_controller,
             router,
             security_config,
-            _snap: PhantomData,
+            store_path,
+            resource_manager,
         })
     }
 
-    pub async fn dump_prof(seconds: u64) -> std::result::Result<Vec<u8>, ProfError> {
-        let guard = profiler_guard::new_prof().await?;
-        info!("start memory profiling {} seconds", seconds);
+    fn list_heap_prof(_req: Request<Body>) -> hyper::Result<Response<Body>> {
+        let profiles = match list_heap_profiles() {
+            Ok(s) => s,
+            Err(e) => return Ok(make_response(StatusCode::INTERNAL_SERVER_ERROR, e)),
+        };
 
-        let timer = GLOBAL_TIMER_HANDLE.clone();
-        let _ = Compat01As03::new(timer.delay(Instant::now() + Duration::from_secs(seconds))).await;
-        let tmp_dir = TempDir::new()?;
-        let os_path = tmp_dir.path().join("tikv_dump_profile").into_os_string();
-        let path = os_path
-            .into_string()
-            .map_err(ProfError::PathEncodingError)?;
-        tikv_alloc::dump_prof(&path)?;
-        drop(guard);
-        let mut file = tokio::fs::File::open(path).await?;
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf).await?;
-        Ok(buf)
+        let text = profiles
+            .into_iter()
+            .map(|(f, ct)| format!("{}\t\t{}", f, ct))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes();
+
+        let response = Response::builder()
+            .header("Content-Type", mime::TEXT_PLAIN.to_string())
+            .header("Content-Length", text.len())
+            .body(text.into())
+            .unwrap();
+        Ok(response)
     }
 
-    pub async fn dump_prof_to_resp(req: Request<Body>) -> hyper::Result<Response<Body>> {
-        let query = match req.uri().query() {
-            Some(query) => query,
-            None => {
-                return Ok(StatusServer::err_response(
-                    StatusCode::BAD_REQUEST,
-                    "request should have the query part",
-                ));
-            }
-        };
+    async fn activate_heap_prof(
+        req: Request<Body>,
+        store_path: PathBuf,
+    ) -> hyper::Result<Response<Body>> {
+        let query = req.uri().query().unwrap_or("");
         let query_pairs: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).collect();
-        let seconds: u64 = match query_pairs.get("seconds") {
+
+        let interval: u64 = match query_pairs.get("interval") {
             Some(val) => match val.parse() {
                 Ok(val) => val,
-                Err(_) => {
-                    return Ok(StatusServer::err_response(
-                        StatusCode::BAD_REQUEST,
-                        "request should have seconds argument",
-                    ));
-                }
+                Err(err) => return Ok(make_response(StatusCode::BAD_REQUEST, err.to_string())),
             },
-            None => 10,
+            None => 60,
         };
 
-        match Self::dump_prof(seconds).await {
-            Ok(buf) => {
-                let response = Response::builder()
+        let interval = Duration::from_secs(interval);
+        let period = GLOBAL_TIMER_HANDLE
+            .interval(Instant::now() + interval, interval)
+            .compat()
+            .map_ok(|_| ())
+            .map_err(|_| TIMER_CANCELED.to_owned())
+            .into_stream();
+        let (tx, rx) = oneshot::channel();
+        let callback = move || tx.send(()).unwrap_or_default();
+        let res = Handle::current().spawn(activate_heap_profile(period, store_path, callback));
+        if rx.await.is_ok() {
+            let msg = "activate heap profile success";
+            Ok(make_response(StatusCode::OK, msg))
+        } else {
+            let errmsg = format!("{:?}", res.await);
+            Ok(make_response(StatusCode::INTERNAL_SERVER_ERROR, errmsg))
+        }
+    }
+
+    fn deactivate_heap_prof(_req: Request<Body>) -> hyper::Result<Response<Body>> {
+        let body = if deactivate_heap_profile() {
+            "deactivate heap profile success"
+        } else {
+            "no heap profile is running"
+        };
+        Ok(make_response(StatusCode::OK, body))
+    }
+
+    #[allow(dead_code)]
+    async fn dump_heap_prof_to_resp(req: Request<Body>) -> hyper::Result<Response<Body>> {
+        let query = req.uri().query().unwrap_or("");
+        let query_pairs: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).collect();
+
+        let use_jeprof = query_pairs.get("jeprof").map(|x| x.as_ref()) == Some("true");
+
+        let result = if let Some(name) = query_pairs.get("name") {
+            if use_jeprof {
+                jeprof_heap_profile(name)
+            } else {
+                read_file(name)
+            }
+        } else {
+            let mut seconds = 10;
+            if let Some(s) = query_pairs.get("seconds") {
+                match s.parse() {
+                    Ok(val) => seconds = val,
+                    Err(_) => {
+                        let errmsg = "request should have seconds argument".to_owned();
+                        return Ok(make_response(StatusCode::BAD_REQUEST, errmsg));
+                    }
+                }
+            }
+            let timer = GLOBAL_TIMER_HANDLE.delay(Instant::now() + Duration::from_secs(seconds));
+            let end = Compat01As03::new(timer)
+                .map_err(|_| TIMER_CANCELED.to_owned())
+                .into_future();
+            start_one_heap_profile(end, use_jeprof).await
+        };
+
+        match result {
+            Ok(body) => {
+                info!("dump or get heap profile successfully");
+                let mut response = Response::builder()
                     .header("X-Content-Type-Options", "nosniff")
                     .header("Content-Disposition", "attachment; filename=\"profile\"")
-                    .header("Content-Type", mime::APPLICATION_OCTET_STREAM.to_string())
-                    .header("Content-Length", buf.len())
-                    .body(buf.into())
-                    .unwrap();
-                Ok(response)
+                    .header("Content-Length", body.len());
+                response = if use_jeprof {
+                    response.header("Content-Type", mime::IMAGE_SVG.to_string())
+                } else {
+                    response.header("Content-Type", mime::APPLICATION_OCTET_STREAM.to_string())
+                };
+                Ok(response.body(body.into()).unwrap())
             }
-            Err(err) => Ok(StatusServer::err_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                err.to_string(),
-            )),
+            Err(e) => {
+                info!("dump or get heap profile fail: {}", e);
+                Ok(make_response(StatusCode::INTERNAL_SERVER_ERROR, e))
+            }
         }
     }
 
@@ -259,12 +256,7 @@ where
             full = match query_pairs.get("full") {
                 Some(val) => match val.parse() {
                     Ok(val) => val,
-                    Err(err) => {
-                        return Ok(StatusServer::err_response(
-                            StatusCode::BAD_REQUEST,
-                            err.to_string(),
-                        ));
-                    }
+                    Err(err) => return Ok(make_response(StatusCode::BAD_REQUEST, err.to_string())),
                 },
                 None => false,
             };
@@ -281,10 +273,7 @@ where
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(json))
                 .unwrap(),
-            Err(_) => StatusServer::err_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal Server Error",
-            ),
+            Err(_) => make_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"),
         })
     }
 
@@ -301,54 +290,60 @@ where
             .await?;
         Ok(match decode_json(&body) {
             Ok(change) => match cfg_controller.update(change) {
-                Err(e) => StatusServer::err_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to update, error: {:?}", e),
-                ),
+                Err(e) => {
+                    if let Some(e) = e.downcast_ref::<std::io::Error>() {
+                        make_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!(
+                                "config changed, but failed to persist change due to err: {:?}",
+                                e
+                            ),
+                        )
+                    } else {
+                        make_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("failed to update, error: {:?}", e),
+                        )
+                    }
+                }
                 Ok(_) => {
                     let mut resp = Response::default();
                     *resp.status_mut() = StatusCode::OK;
                     resp
                 }
             },
-            Err(e) => StatusServer::err_response(
+            Err(e) => make_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to decode, error: {:?}", e),
             ),
         })
     }
 
-    pub async fn dump_rsprof(seconds: u64, frequency: i32) -> pprof::Result<pprof::Report> {
-        let guard = pprof::ProfilerGuard::new(frequency)?;
-        info!(
-            "start profiling {} seconds with frequency {} /s",
-            seconds, frequency
-        );
-        let timer = GLOBAL_TIMER_HANDLE.clone();
-        let _ = Compat01As03::new(timer.delay(Instant::now() + Duration::from_secs(seconds))).await;
-        guard
-            .report()
-            .frames_post_processor(StatusServer::frames_post_processor())
-            .build()
+    async fn update_config_from_toml_file(
+        cfg_controller: ConfigController,
+        _req: Request<Body>,
+    ) -> hyper::Result<Response<Body>> {
+        match cfg_controller.update_from_toml_file() {
+            Err(e) => Ok(make_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to update, error: {:?}", e),
+            )),
+            Ok(_) => {
+                let mut resp = Response::default();
+                *resp.status_mut() = StatusCode::OK;
+                Ok(resp)
+            }
+        }
     }
 
-    pub async fn dump_rsperf_to_resp(req: Request<Body>) -> hyper::Result<Response<Body>> {
-        let query = match req.uri().query() {
-            Some(query) => query,
-            None => {
-                return Ok(StatusServer::err_response(StatusCode::BAD_REQUEST, ""));
-            }
-        };
+    pub async fn dump_cpu_prof_to_resp(req: Request<Body>) -> hyper::Result<Response<Body>> {
+        let query = req.uri().query().unwrap_or("");
         let query_pairs: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).collect();
+
         let seconds: u64 = match query_pairs.get("seconds") {
             Some(val) => match val.parse() {
                 Ok(val) => val,
-                Err(err) => {
-                    return Ok(StatusServer::err_response(
-                        StatusCode::BAD_REQUEST,
-                        err.to_string(),
-                    ));
-                }
+                Err(err) => return Ok(make_response(StatusCode::BAD_REQUEST, err.to_string())),
             },
             None => 10,
         };
@@ -356,56 +351,41 @@ where
         let frequency: i32 = match query_pairs.get("frequency") {
             Some(val) => match val.parse() {
                 Ok(val) => val,
-                Err(err) => {
-                    return Ok(StatusServer::err_response(
-                        StatusCode::BAD_REQUEST,
-                        err.to_string(),
-                    ));
-                }
+                Err(err) => return Ok(make_response(StatusCode::BAD_REQUEST, err.to_string())),
             },
-            None => 99, // Default frequency of sampling. 99Hz to avoid coincide with special periods
+            None => 99, /* Default frequency of sampling. 99Hz to avoid coincide with special
+                         * periods */
         };
 
         let prototype_content_type: hyper::http::HeaderValue =
             hyper::http::HeaderValue::from_str("application/protobuf").unwrap();
-        let report = match Self::dump_rsprof(seconds, frequency).await {
-            Ok(report) => report,
-            Err(err) => {
-                return Ok(StatusServer::err_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    err.to_string(),
-                ));
-            }
-        };
+        let output_protobuf = req.headers().get("Content-Type") == Some(&prototype_content_type);
 
-        let mut body: Vec<u8> = Vec::new();
-        if req.headers().get("Content-Type") == Some(&prototype_content_type) {
-            match report.pprof() {
-                Ok(profile) => match profile.encode(&mut body) {
-                    Ok(()) => {
-                        info!("write report successfully");
-                        Ok(StatusServer::err_response(StatusCode::OK, body))
-                    }
-                    Err(err) => Ok(StatusServer::err_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        err.to_string(),
-                    )),
-                },
-                Err(err) => Ok(StatusServer::err_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    err.to_string(),
-                )),
+        let timer = GLOBAL_TIMER_HANDLE.delay(Instant::now() + Duration::from_secs(seconds));
+        let end = async move {
+            Compat01As03::new(timer)
+                .await
+                .map_err(|_| TIMER_CANCELED.to_owned())
+        };
+        match start_one_cpu_profile(end, frequency, output_protobuf).await {
+            Ok(body) => {
+                info!("dump cpu profile successfully");
+                let mut response = Response::builder()
+                    .header(
+                        "Content-Disposition",
+                        "attachment; filename=\"cpu_profile\"",
+                    )
+                    .header("Content-Length", body.len());
+                response = if output_protobuf {
+                    response.header("Content-Type", mime::APPLICATION_OCTET_STREAM.to_string())
+                } else {
+                    response.header("Content-Type", mime::IMAGE_SVG.to_string())
+                };
+                Ok(response.body(body.into()).unwrap())
             }
-        } else {
-            match report.flamegraph(&mut body) {
-                Ok(_) => {
-                    info!("write report successfully");
-                    Ok(StatusServer::err_response(StatusCode::OK, body))
-                }
-                Err(err) => Ok(StatusServer::err_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    err.to_string(),
-                )),
+            Err(e) => {
+                info!("dump cpu profile fail: {}", e);
+                Ok(make_response(StatusCode::INTERNAL_SERVER_ERROR, e))
             }
         }
     }
@@ -424,21 +404,16 @@ where
 
         match log_level_request {
             Ok(req) => {
-                set_log_level(req.log_level);
+                set_log_level(req.log_level.into());
                 Ok(Response::new(Body::empty()))
             }
-            Err(err) => Ok(StatusServer::err_response(
-                StatusCode::BAD_REQUEST,
-                err.to_string(),
-            )),
+            Err(err) => Ok(make_response(StatusCode::BAD_REQUEST, err.to_string())),
         }
     }
 
-    pub fn stop(mut self) {
-        // unregister the status address to pd
-        self.unregister_addr();
+    pub fn stop(self) {
         let _ = self.tx.send(());
-        self.thread_pool.shutdown_timeout(Duration::from_secs(10));
+        self.thread_pool.shutdown_timeout(Duration::from_secs(3));
     }
 
     // Return listening address, this may only be used for outer test
@@ -447,174 +422,19 @@ where
     pub fn listening_addr(&self) -> SocketAddr {
         self.addr.unwrap()
     }
-
-    // Conveniently generate ssl connector according to SecurityConfig for https client
-    // Return `None` if SecurityConfig is not set up.
-    fn generate_ssl_connector(&self) -> Option<SslConnectorBuilder> {
-        if !self.security_config.cert_path.is_empty()
-            && !self.security_config.key_path.is_empty()
-            && !self.security_config.ca_path.is_empty()
-        {
-            let mut ssl = SslConnector::builder(SslMethod::tls()).unwrap();
-            ssl.set_ca_file(&self.security_config.ca_path).unwrap();
-            ssl.set_certificate_file(&self.security_config.cert_path, SslFiletype::PEM)
-                .unwrap();
-            ssl.set_private_key_file(&self.security_config.key_path, SslFiletype::PEM)
-                .unwrap();
-            Some(ssl)
-        } else {
-            None
-        }
-    }
-
-    fn register_addr(&mut self, advertise_addr: String) {
-        if let Some(ssl) = self.generate_ssl_connector() {
-            let mut connector = HttpConnector::new();
-            connector.enforce_http(false);
-            let https_conn = HttpsConnector::with_connector(connector, ssl).unwrap();
-            self.register_addr_core(https_conn, advertise_addr);
-        } else {
-            self.register_addr_core(HttpConnector::new(), advertise_addr);
-        }
-    }
-
-    fn register_addr_core<C>(&mut self, conn: C, advertise_addr: String)
-    where
-        C: hyper::client::connect::Connect + Clone + Send + Sync + 'static,
-    {
-        if self.pd_client.is_none() {
-            return;
-        }
-        let pd_client = self.pd_client.as_ref().unwrap();
-        let client = Client::builder().build::<_, Body>(conn);
-
-        let json = {
-            let mut body = std::collections::HashMap::new();
-            body.insert("component".to_owned(), COMPONENT.to_owned());
-            body.insert("addr".to_owned(), advertise_addr.clone());
-            serde_json::to_string(&body).unwrap()
-        };
-
-        for _ in 0..COMPONENT_REQUEST_RETRY {
-            for pd_addr in pd_client.get_leader().get_client_urls() {
-                let client = client.clone();
-                let uri: Uri = (pd_addr.to_owned() + "/pd/api/v1/component")
-                    .parse()
-                    .unwrap();
-                let req = Request::builder()
-                    .method("POST")
-                    .uri(uri)
-                    .header(http::header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(json.clone()))
-                    .expect("construct post request failed");
-                let req_handle = self
-                    .thread_pool
-                    .spawn(async move { client.request(req).await });
-
-                match block_on(req_handle).unwrap() {
-                    Ok(resp) if resp.status() == StatusCode::OK => {
-                        self.advertise_addr = Some(advertise_addr);
-                        return;
-                    }
-                    Ok(resp) => {
-                        let status = resp.status();
-                        warn!("failed to register addr to pd"; "status code" => status.as_str(), "body" => ?resp.body());
-                    }
-                    Err(e) => warn!("failed to register addr to pd"; "error" => ?e),
-                }
-            }
-            // refresh the pd leader
-            if let Err(e) = pd_client.reconnect() {
-                warn!("failed to reconnect pd client"; "err" => ?e);
-                thread::sleep(REQUEST_RECONNECT_INTERVAL);
-            }
-        }
-        warn!(
-            "failed to register addr to pd after {} tries",
-            COMPONENT_REQUEST_RETRY
-        );
-    }
-
-    fn unregister_addr(&mut self) {
-        if let Some(ssl) = self.generate_ssl_connector() {
-            let mut connector = HttpConnector::new();
-            connector.enforce_http(false);
-            let https_conn = HttpsConnector::with_connector(connector, ssl).unwrap();
-            self.unregister_addr_core(https_conn);
-        } else {
-            self.unregister_addr_core(HttpConnector::new());
-        }
-    }
-
-    fn unregister_addr_core<C>(&mut self, conn: C)
-    where
-        C: hyper::client::connect::Connect + Clone + Send + Sync + 'static,
-    {
-        if self.pd_client.is_none() || self.advertise_addr.is_none() {
-            return;
-        }
-        let advertise_addr = self.advertise_addr.as_ref().unwrap().to_owned();
-        let pd_client = self.pd_client.as_ref().unwrap();
-        let client = Client::builder().build::<_, Body>(conn);
-
-        for _ in 0..COMPONENT_REQUEST_RETRY {
-            for pd_addr in pd_client.get_leader().get_client_urls() {
-                let client = client.clone();
-                let uri: Uri = (pd_addr.to_owned()
-                    + &format!("/pd/api/v1/component/{}/{}", COMPONENT, advertise_addr))
-                    .parse()
-                    .unwrap();
-                let req = Request::delete(uri)
-                    .body(Body::empty())
-                    .expect("construct delete request failed");
-                let req_handle = self
-                    .thread_pool
-                    .spawn(async move { client.request(req).await });
-
-                match block_on(req_handle).unwrap() {
-                    Ok(resp) if resp.status() == StatusCode::OK => {
-                        self.advertise_addr = None;
-                        return;
-                    }
-                    Ok(resp) => {
-                        let status = resp.status();
-                        warn!("failed to unregister addr to pd"; "status code" => status.as_str(), "body" => ?resp.body());
-                    }
-                    Err(e) => warn!("failed to unregister addr to pd"; "error" => ?e),
-                }
-            }
-            // refresh the pd leader
-            if let Err(e) = pd_client.reconnect() {
-                warn!("failed to reconnect pd client"; "err" => ?e);
-                thread::sleep(REQUEST_RECONNECT_INTERVAL);
-            }
-        }
-        warn!(
-            "failed to unregister addr to pd after {} tries",
-            COMPONENT_REQUEST_RETRY
-        );
-    }
 }
 
-impl<E, R> StatusServer<E, R>
+impl<R> StatusServer<R>
 where
-    E: KvEngine,
-    R: 'static + Send + CasualRouter<E> + Clone,
+    R: 'static + Send + RaftExtension + Clone,
 {
     pub async fn dump_region_meta(req: Request<Body>, router: R) -> hyper::Result<Response<Body>> {
         lazy_static! {
             static ref REGION: Regex = Regex::new(r"/region/(?P<id>\d+)").unwrap();
         }
 
-        fn err_resp(
-            status_code: StatusCode,
-            msg: impl Into<Body>,
-        ) -> hyper::Result<Response<Body>> {
-            Ok(StatusServer::err_response(status_code, msg))
-        }
-
         fn not_found(msg: impl Into<Body>) -> hyper::Result<Response<Body>> {
-            err_resp(StatusCode::NOT_FOUND, msg)
+            Ok(make_response(StatusCode::NOT_FOUND, msg))
         }
 
         let cap = match REGION.captures(req.uri().path()) {
@@ -625,39 +445,24 @@ where
         let id: u64 = match cap["id"].parse() {
             Ok(id) => id,
             Err(err) => {
-                return err_resp(
+                return Ok(make_response(
                     StatusCode::BAD_REQUEST,
                     format!("invalid region id: {}", err),
-                );
+                ));
             }
         };
-        let (tx, rx) = oneshot::channel();
-        match router.send(
-            id,
-            CasualMessage::AccessPeer(Box::new(move |peer| {
-                if let Err(meta) = tx.send(region_meta::RegionMeta::new(peer)) {
-                    error!("receiver dropped, region meta: {:?}", meta)
-                }
-            })),
-        ) {
-            Ok(_) => (),
-            Err(raftstore::Error::RegionNotFound(_)) => {
+        let f = router.query_region(id);
+        let meta = match f.await {
+            Ok(meta) => meta,
+            Err(tikv_kv::Error(box tikv_kv::ErrorInner::Request(header)))
+                if header.has_region_not_found() =>
+            {
                 return not_found(format!("region({}) not found", id));
             }
             Err(err) => {
-                return err_resp(
+                return Ok(make_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("channel pending or disconnect: {}", err),
-                );
-            }
-        }
-
-        let meta = match rx.await {
-            Ok(meta) => meta,
-            Err(_) => {
-                return Ok(StatusServer::err_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "query cancelled",
+                    format!("query failed: {}", err),
                 ));
             }
         };
@@ -665,22 +470,63 @@ where
         let body = match serde_json::to_vec(&meta) {
             Ok(body) => body,
             Err(err) => {
-                return Ok(StatusServer::err_response(
+                return Ok(make_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("fails to json: {}", err),
                 ));
             }
+        };
+
+        #[cfg(feature = "trace-tablet-lifetime")]
+        let body = {
+            let query = req.uri().query().unwrap_or("");
+            let query_pairs: HashMap<_, _> =
+                url::form_urlencoded::parse(query.as_bytes()).collect();
+
+            let mut body = body;
+            if query_pairs.contains_key("trace-tablet") {
+                for s in engine_rocks::RocksEngine::trace(id) {
+                    body.push(b'\n');
+                    body.extend_from_slice(s.as_bytes());
+                }
+            };
+            body
         };
         match Response::builder()
             .header("content-type", "application/json")
             .body(hyper::Body::from(body))
         {
             Ok(resp) => Ok(resp),
-            Err(err) => Ok(StatusServer::err_response(
+            Err(err) => Ok(make_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("fails to build response: {}", err),
             )),
         }
+    }
+
+    fn handle_get_metrics(
+        req: Request<Body>,
+        mgr: &ConfigController,
+    ) -> hyper::Result<Response<Body>> {
+        let should_simplify = mgr.get_current().server.simplify_metrics;
+        let gz_encoding = client_accept_gzip(&req);
+        let metrics = if gz_encoding {
+            // gzip can reduce the body size to less than 1/10.
+            let mut encoder = GzEncoder::new(vec![], Compression::default());
+            dump_to(&mut encoder, should_simplify);
+            encoder.finish().unwrap()
+        } else {
+            dump(should_simplify).into_bytes()
+        };
+        let mut resp = Response::new(metrics.into());
+        resp.headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static(TEXT_FORMAT));
+        if gz_encoding {
+            resp.headers_mut()
+                .insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        }
+
+        Ok(resp)
     }
 
     fn start_serve<I, C>(&mut self, builder: HyperBuilder<I>)
@@ -693,12 +539,16 @@ where
         let security_config = self.security_config.clone();
         let cfg_controller = self.cfg_controller.clone();
         let router = self.router.clone();
+        let store_path = self.store_path.clone();
+        let resource_manager = self.resource_manager.clone();
         // Start to serve.
         let server = builder.serve(make_service_fn(move |conn: &C| {
             let x509 = conn.get_x509();
             let security_config = security_config.clone();
             let cfg_controller = cfg_controller.clone();
             let router = router.clone();
+            let store_path = store_path.clone();
+            let resource_manager = resource_manager.clone();
             async move {
                 // Create a status service.
                 Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
@@ -706,6 +556,8 @@ where
                     let security_config = security_config.clone();
                     let cfg_controller = cfg_controller.clone();
                     let router = router.clone();
+                    let store_path = store_path.clone();
+                    let resource_manager = resource_manager.clone();
                     async move {
                         let path = req.uri().path().to_owned();
                         let method = req.method().to_owned();
@@ -718,8 +570,9 @@ where
                         }
 
                         // 1. POST "/config" will modify the configuration of TiKV.
-                        // 2. GET "/region" will get start key and end key. These keys could be actual
-                        // user data since in some cases the data itself is stored in the key.
+                        // 2. GET "/region" will get start key and end key. These keys could be
+                        // actual user data since in some cases the data itself is stored in the
+                        // key.
                         let should_check_cert = !matches!(
                             (&method, path.as_ref()),
                             (&Method::GET, "/metrics")
@@ -729,26 +582,43 @@ where
                         );
 
                         if should_check_cert && !check_cert(security_config, x509) {
-                            return Ok(StatusServer::err_response(
+                            return Ok(make_response(
                                 StatusCode::FORBIDDEN,
                                 "certificate role error",
                             ));
                         }
 
                         match (method, path.as_ref()) {
-                            (Method::GET, "/metrics") => Ok(Response::new(dump().into())),
-                            (Method::GET, "/status") => Ok(Response::default()),
-                            (Method::GET, "/debug/pprof/heap") => {
-                                Self::dump_prof_to_resp(req).await
+                            (Method::GET, "/metrics") => {
+                                Self::handle_get_metrics(req, &cfg_controller)
                             }
+                            (Method::GET, "/status") => Ok(Response::default()),
+                            (Method::GET, "/debug/pprof/heap_list") => Self::list_heap_prof(req),
+                            (Method::GET, "/debug/pprof/heap_activate") => {
+                                Self::activate_heap_prof(req, store_path).await
+                            }
+                            (Method::GET, "/debug/pprof/heap_deactivate") => {
+                                Self::deactivate_heap_prof(req)
+                            }
+                            // (Method::GET, "/debug/pprof/heap") => {
+                            //     Self::dump_heap_prof_to_resp(req).await
+                            // }
                             (Method::GET, "/config") => {
                                 Self::get_config(req, &cfg_controller).await
                             }
                             (Method::POST, "/config") => {
                                 Self::update_config(cfg_controller.clone(), req).await
                             }
+                            // This interface is used for configuration file hosting scenarios,
+                            // TiKV will not update configuration files, and this interface will
+                            // silently ignore configration items that cannot be updated online,
+                            // hand it over to the hosting platform for processing.
+                            (Method::PUT, "/config/reload") => {
+                                Self::update_config_from_toml_file(cfg_controller.clone(), req)
+                                    .await
+                            }
                             (Method::GET, "/debug/pprof/profile") => {
-                                Self::dump_rsperf_to_resp(req).await
+                                Self::dump_cpu_prof_to_resp(req).await
                             }
                             (Method::GET, "/debug/fail_point") => {
                                 info!("debug fail point API start");
@@ -762,10 +632,10 @@ where
                             (Method::PUT, path) if path.starts_with("/log-level") => {
                                 Self::change_log_level(req).await
                             }
-                            _ => Ok(StatusServer::err_response(
-                                StatusCode::NOT_FOUND,
-                                "path not found",
-                            )),
+                            (Method::GET, "/resource_groups") => {
+                                Self::handle_get_all_resource_groups(resource_manager.as_ref())
+                            }
+                            _ => Ok(make_response(StatusCode::NOT_FOUND, "path not found")),
                         }
                     }
                 }))
@@ -781,33 +651,85 @@ where
         self.thread_pool.spawn(graceful);
     }
 
-    pub fn start(&mut self, status_addr: String, advertise_status_addr: String) -> Result<()> {
+    pub fn start(&mut self, status_addr: String) -> Result<()> {
         let addr = SocketAddr::from_str(&status_addr)?;
 
-        let incoming = self.thread_pool.enter(|| AddrIncoming::bind(&addr))?;
+        let incoming = {
+            let _enter = self.thread_pool.enter();
+            AddrIncoming::bind(&addr)
+        }?;
         self.addr = Some(incoming.local_addr());
         if !self.security_config.cert_path.is_empty()
             && !self.security_config.key_path.is_empty()
             && !self.security_config.ca_path.is_empty()
         {
-            let mut acceptor = SslAcceptor::mozilla_modern(SslMethod::tls())?;
-            acceptor.set_ca_file(&self.security_config.ca_path)?;
-            acceptor.set_certificate_chain_file(&self.security_config.cert_path)?;
-            acceptor.set_private_key_file(&self.security_config.key_path, SslFiletype::PEM)?;
-            if !self.security_config.cert_allowed_cn.is_empty() {
-                acceptor.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
-            }
-            let acceptor = acceptor.build();
-            let tls_incoming = tls_incoming(acceptor, incoming);
+            let tls_incoming = tls_incoming(self.security_config.clone(), incoming)?;
             let server = Server::builder(tls_incoming);
             self.start_serve(server);
         } else {
             let server = Server::builder(incoming);
             self.start_serve(server);
         }
-        // register the advertise status address to pd
-        self.register_addr(advertise_status_addr);
         Ok(())
+    }
+
+    pub fn handle_get_all_resource_groups(
+        mgr: Option<&Arc<ResourceGroupManager>>,
+    ) -> hyper::Result<Response<Body>> {
+        let groups = if let Some(mgr) = mgr {
+            mgr.get_all_resource_groups()
+                .into_iter()
+                .map(into_debug_request_group)
+                .collect()
+        } else {
+            vec![]
+        };
+        let body = match serde_json::to_vec(&groups) {
+            Ok(body) => body,
+            Err(err) => {
+                return Ok(make_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("fails to json: {}", err),
+                ));
+            }
+        };
+        match Response::builder()
+            .header("content-type", "application/json")
+            .body(hyper::Body::from(body))
+        {
+            Ok(resp) => Ok(resp),
+            Err(err) => Ok(make_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("fails to build response: {}", err),
+            )),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ResourceGroupSetting {
+    name: String,
+    ru: u64,
+    priority: u32,
+    burst_limit: i64,
+}
+
+fn into_debug_request_group(rg: ResourceGroup) -> ResourceGroupSetting {
+    ResourceGroupSetting {
+        name: rg.name,
+        ru: rg
+            .r_u_settings
+            .get_ref()
+            .get_r_u()
+            .get_settings()
+            .get_fill_rate(),
+        priority: rg.priority,
+        burst_limit: rg
+            .r_u_settings
+            .get_ref()
+            .get_r_u()
+            .get_settings()
+            .get_burst_limit(),
     }
 }
 
@@ -855,10 +777,41 @@ fn check_cert(security_config: Arc<SecurityConfig>, cert: Option<X509>) -> bool 
     }
 }
 
+fn tls_acceptor(security_config: &SecurityConfig) -> Result<SslAcceptor> {
+    let mut acceptor = SslAcceptor::mozilla_modern(SslMethod::tls())?;
+    acceptor.set_ca_file(&security_config.ca_path)?;
+    acceptor.set_certificate_chain_file(&security_config.cert_path)?;
+    acceptor.set_private_key_file(&security_config.key_path, SslFiletype::PEM)?;
+    if !security_config.cert_allowed_cn.is_empty() {
+        acceptor.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+    }
+    Ok(acceptor.build())
+}
+
 fn tls_incoming(
-    acceptor: SslAcceptor,
+    security_config: Arc<SecurityConfig>,
     mut incoming: AddrIncoming,
-) -> impl Accept<Conn = SslStream<AddrStream>, Error = std::io::Error> {
+) -> Result<impl Accept<Conn = SslStream<AddrStream>, Error = std::io::Error>> {
+    let mut context = tls_acceptor(&security_config)?.into_context();
+    let mut cert_last_modified_time = None;
+    let mut handle_ssl_error = move |context: &mut SslContext| {
+        match security_config.is_modified(&mut cert_last_modified_time) {
+            Ok(true) => match tls_acceptor(&security_config) {
+                Ok(acceptor) => {
+                    *context = acceptor.into_context();
+                }
+                Err(e) => {
+                    error!("Failed to reload TLS certificate: {}", e);
+                }
+            },
+            Ok(false) => {
+                // TLS certificate is not changed, do nothing
+            }
+            Err(e) => {
+                error!("Failed to load certificate file metadata: {}", e);
+            }
+        }
+    };
     let s = stream! {
         loop {
             let stream = match poll_fn(|cx| Pin::new(&mut incoming).poll_accept(cx)).await {
@@ -869,18 +822,34 @@ fn tls_incoming(
                 }
                 None => break,
             };
-            match tokio_openssl::accept(&acceptor, stream).await {
-                Err(_) => {
-                    error!("Status server error: TLS handshake error");
+            let ssl = match Ssl::new(&context) {
+                Ok(ssl) => ssl,
+                Err(err) => {
+                    error!("Status server error: {}", err);
+                    handle_ssl_error(&mut context);
                     continue;
-                },
-                Ok(ssl_stream) => {
-                    yield Ok(ssl_stream);
-                },
-            }
+                }
+            };
+            match tokio_openssl::SslStream::new(ssl, stream) {
+                Ok(mut ssl_stream) => match Pin::new(&mut ssl_stream).accept().await {
+                    Err(_) => {
+                        error!("Status server error: TLS handshake error");
+                        handle_ssl_error(&mut context);
+                        continue;
+                    },
+                    Ok(()) => {
+                        yield Ok(ssl_stream);
+                    },
+                }
+                Err(err) => {
+                    error!("Status server error: {}", err);
+                    handle_ssl_error(&mut context);
+                    continue;
+                }
+            };
         }
     };
-    TlsIncoming(s)
+    Ok(TlsIncoming(s))
 }
 
 #[pin_project]
@@ -895,7 +864,7 @@ where
 
     fn poll_accept(
         self: Pin<&mut Self>,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
     ) -> Poll<Option<std::io::Result<Self::Conn>>> {
         self.project().0.poll_next(cx)
     }
@@ -957,7 +926,8 @@ async fn handle_fail_points_request(req: Request<Body>) -> hyper::Result<Respons
             Ok(Response::new(body.into()))
         }
         (Method::GET, _) => {
-            // In this scope the path must be like /fail...(/...), which starts with FAIL_POINTS_REQUEST_PATH and may or may not have a sub path
+            // In this scope the path must be like /fail...(/...), which starts with
+            // FAIL_POINTS_REQUEST_PATH and may or may not have a sub path
             // Now we return 404 when path is neither /fail nor /fail/
             if path != FAIL_POINTS_REQUEST_PATH && path != fail_path {
                 return Ok(Response::builder()
@@ -979,6 +949,21 @@ async fn handle_fail_points_request(req: Request<Body>) -> hyper::Result<Respons
             .body(Body::empty())
             .unwrap()),
     }
+}
+
+// check if the client allow return response with gzip compression
+// the following logic is port from prometheus's golang:
+// https://github.com/prometheus/client_golang/blob/24172847e35ba46025c49d90b8846b59eb5d9ead/prometheus/promhttp/http.go#L155-L176
+fn client_accept_gzip(req: &Request<Body>) -> bool {
+    let encoding = req
+        .headers()
+        .get(ACCEPT_ENCODING)
+        .map(|enc| enc.to_str().unwrap_or_default())
+        .unwrap_or_default();
+    encoding
+        .split(',')
+        .map(|s| s.trim())
+        .any(|s| s == "gzip" || s.starts_with("gzip;"))
 }
 
 // Decode different type of json value to string value
@@ -1004,53 +989,66 @@ fn decode_json(
     }
 }
 
+fn make_response<T>(status_code: StatusCode, message: T) -> Response<Body>
+where
+    T: Into<Body>,
+{
+    Response::builder()
+        .status(status_code)
+        .body(message.into())
+        .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
-    use futures::executor::block_on;
-    use futures::future::ok;
-    use futures::prelude::*;
-    use hyper::client::HttpConnector;
-    use hyper::{Body, Client, Method, Request, StatusCode, Uri};
-    use hyper_openssl::HttpsConnector;
-    use openssl::ssl::SslFiletype;
-    use openssl::ssl::{SslConnector, SslMethod};
+    use std::{env, io::Read, path::PathBuf, sync::Arc};
 
-    use std::env;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    use crate::config::{ConfigController, TiKvConfig};
-    use crate::server::status_server::{LogLevelRequest, StatusServer};
     use collections::HashSet;
-    use configuration::Configuration;
-    use engine_test::kv::KvTestEngine;
-    use raftstore::store::transport::CasualRouter;
-    use raftstore::store::CasualMessage;
+    use flate2::read::GzDecoder;
+    use futures::{
+        executor::block_on,
+        future::{ok, BoxFuture},
+        prelude::*,
+    };
+    use http::header::{HeaderValue, ACCEPT_ENCODING};
+    use hyper::{body::Buf, client::HttpConnector, Body, Client, Method, Request, StatusCode, Uri};
+    use hyper_openssl::HttpsConnector;
+    use online_config::OnlineConfig;
+    use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
+    use raftstore::store::region_meta::RegionMeta;
     use security::SecurityConfig;
     use test_util::new_security_cfg;
+    use tikv_kv::RaftExtension;
     use tikv_util::logger::get_log_level;
+
+    use crate::{
+        config::{ConfigController, TikvConfig},
+        server::status_server::{profile::TEST_PROFILE_MUTEX, LogLevelRequest, StatusServer},
+    };
 
     #[derive(Clone)]
     struct MockRouter;
 
-    impl CasualRouter<KvTestEngine> for MockRouter {
-        fn send(&self, region_id: u64, _: CasualMessage<KvTestEngine>) -> raftstore::Result<()> {
-            Err(raftstore::Error::RegionNotFound(region_id))
+    impl RaftExtension for MockRouter {
+        fn query_region(&self, region_id: u64) -> BoxFuture<'static, tikv_kv::Result<RegionMeta>> {
+            Box::pin(async move { Err(raftstore::Error::RegionNotFound(region_id).into()) })
         }
     }
 
     #[test]
     fn test_status_service() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
-            None,
             ConfigController::default(),
             Arc::new(SecurityConfig::default()),
             MockRouter,
+            temp_dir.path().to_path_buf(),
+            None,
         )
         .unwrap();
         let addr = "127.0.0.1:0".to_owned();
-        let _ = status_server.start(addr.clone(), addr);
+        let _ = status_server.start(addr);
         let client = Client::new();
         let uri = Uri::builder()
             .scheme("http")
@@ -1088,16 +1086,18 @@ mod tests {
 
     #[test]
     fn test_config_endpoint() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
-            None,
             ConfigController::default(),
             Arc::new(SecurityConfig::default()),
             MockRouter,
+            temp_dir.path().to_path_buf(),
+            None,
         )
         .unwrap();
         let addr = "127.0.0.1:0".to_owned();
-        let _ = status_server.start(addr.clone(), addr);
+        let _ = status_server.start(addr);
         let client = Client::new();
         let uri = Uri::builder()
             .scheme("http")
@@ -1117,12 +1117,12 @@ mod tests {
                 .await
                 .unwrap();
             let resp_json = String::from_utf8_lossy(&v).to_string();
-            let cfg = TiKvConfig::default();
+            let cfg = TikvConfig::default();
             serde_json::to_string(&cfg.get_encoder())
                 .map(|cfg_json| {
                     assert_eq!(resp_json, cfg_json);
                 })
-                .expect("Could not convert TiKvConfig to string");
+                .expect("Could not convert TikvConfig to string");
         });
         block_on(handle).unwrap();
         status_server.stop();
@@ -1132,16 +1132,18 @@ mod tests {
     #[test]
     fn test_status_service_fail_endpoints() {
         let _guard = fail::FailScenario::setup();
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
-            None,
             ConfigController::default(),
             Arc::new(SecurityConfig::default()),
             MockRouter,
+            temp_dir.path().to_path_buf(),
+            None,
         )
         .unwrap();
         let addr = "127.0.0.1:0".to_owned();
-        let _ = status_server.start(addr.clone(), addr);
+        let _ = status_server.start(addr);
         let client = Client::new();
         let addr = status_server.listening_addr().to_string();
 
@@ -1247,16 +1249,18 @@ mod tests {
     #[test]
     fn test_status_service_fail_endpoints_can_trigger_fails() {
         let _guard = fail::FailScenario::setup();
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
-            None,
             ConfigController::default(),
             Arc::new(SecurityConfig::default()),
             MockRouter,
+            temp_dir.path().to_path_buf(),
+            None,
         )
         .unwrap();
         let addr = "127.0.0.1:0".to_owned();
-        let _ = status_server.start(addr.clone(), addr);
+        let _ = status_server.start(addr);
         let client = Client::new();
         let addr = status_server.listening_addr().to_string();
 
@@ -1290,16 +1294,18 @@ mod tests {
     #[test]
     fn test_status_service_fail_endpoints_should_give_404_when_failpoints_are_disable() {
         let _guard = fail::FailScenario::setup();
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
-            None,
             ConfigController::default(),
             Arc::new(SecurityConfig::default()),
             MockRouter,
+            temp_dir.path().to_path_buf(),
+            None,
         )
         .unwrap();
         let addr = "127.0.0.1:0".to_owned();
-        let _ = status_server.start(addr.clone(), addr);
+        let _ = status_server.start(addr);
         let client = Client::new();
         let addr = status_server.listening_addr().to_string();
 
@@ -1324,45 +1330,19 @@ mod tests {
         status_server.stop();
     }
 
-    #[test]
-    fn test_extract_thread_name() {
-        assert_eq!(
-            &StatusServer::extract_thread_name("test-name-1"),
-            "test-name"
-        );
-        assert_eq!(
-            &StatusServer::extract_thread_name("grpc-server-5"),
-            "grpc-server"
-        );
-        assert_eq!(
-            &StatusServer::extract_thread_name("rocksdb:bg1000"),
-            "rocksdb:bg"
-        );
-        assert_eq!(
-            &StatusServer::extract_thread_name("raftstore-1-100"),
-            "raftstore"
-        );
-        assert_eq!(
-            &StatusServer::extract_thread_name("snap sender1000"),
-            "snap-sender"
-        );
-        assert_eq!(
-            &StatusServer::extract_thread_name("snap_sender1000"),
-            "snap-sender"
-        );
-    }
-
     fn do_test_security_status_service(allowed_cn: HashSet<String>, expected: bool) {
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
-            None,
             ConfigController::default(),
             Arc::new(new_security_cfg(Some(allowed_cn))),
             MockRouter,
+            temp_dir.path().to_path_buf(),
+            None,
         )
         .unwrap();
         let addr = "127.0.0.1:0".to_owned();
-        let _ = status_server.start(addr.clone(), addr);
+        let _ = status_server.start(addr);
 
         let mut connector = HttpConnector::new();
         connector.enforce_http(false);
@@ -1425,16 +1405,18 @@ mod tests {
     #[test]
     #[ignore]
     fn test_pprof_heap_service() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
-            None,
             ConfigController::default(),
             Arc::new(SecurityConfig::default()),
             MockRouter,
+            temp_dir.path().to_path_buf(),
+            None,
         )
         .unwrap();
         let addr = "127.0.0.1:0".to_owned();
-        let _ = status_server.start(addr.clone(), addr);
+        let _ = status_server.start(addr);
         let client = Client::new();
         let uri = Uri::builder()
             .scheme("http")
@@ -1453,16 +1435,19 @@ mod tests {
 
     #[test]
     fn test_pprof_profile_service() {
+        let _test_guard = TEST_PROFILE_MUTEX.lock().unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
-            None,
             ConfigController::default(),
             Arc::new(SecurityConfig::default()),
             MockRouter,
+            temp_dir.path().to_path_buf(),
+            None,
         )
         .unwrap();
         let addr = "127.0.0.1:0".to_owned();
-        let _ = status_server.start(addr.clone(), addr);
+        let _ = status_server.start(addr);
         let client = Client::new();
         let uri = Uri::builder()
             .scheme("http")
@@ -1474,23 +1459,85 @@ mod tests {
             .thread_pool
             .spawn(async move { client.get(uri).await.unwrap() });
         let resp = block_on(handle).unwrap();
-
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("Content-Type").unwrap(),
+            &mime::IMAGE_SVG.to_string()
+        );
+        status_server.stop();
+    }
+
+    #[test]
+    fn test_metrics() {
+        let _test_guard = TEST_PROFILE_MUTEX.lock().unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut status_server = StatusServer::new(
+            1,
+            ConfigController::default(),
+            Arc::new(SecurityConfig::default()),
+            MockRouter,
+            temp_dir.path().to_path_buf(),
+            None,
+        )
+        .unwrap();
+        let addr = "127.0.0.1:0".to_owned();
+        let _ = status_server.start(addr);
+
+        // test plain test
+        let uri = Uri::builder()
+            .scheme("http")
+            .authority(status_server.listening_addr().to_string().as_str())
+            .path_and_query("/metrics")
+            .build()
+            .unwrap();
+
+        let client = Client::new();
+        let url_cloned = uri.clone();
+        let handle = status_server
+            .thread_pool
+            .spawn(async move { client.get(url_cloned).await.unwrap() });
+        let resp = block_on(handle).unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = block_on(hyper::body::to_bytes(resp.into_body())).unwrap();
+        String::from_utf8(body_bytes.as_ref().to_owned()).unwrap();
+
+        // test gzip
+        let handle = status_server.thread_pool.spawn(async move {
+            let body = Body::default();
+            let mut req = Request::new(body);
+            req.headers_mut()
+                .insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+            *req.uri_mut() = uri;
+            let client = Client::new();
+            client.request(req).await.unwrap()
+        });
+        let resp = block_on(handle).unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("Content-Encoding").unwrap(), "gzip");
+        let body_bytes = block_on(hyper::body::to_bytes(resp.into_body())).unwrap();
+        let mut decoded_bytes = vec![];
+        GzDecoder::new(body_bytes.reader())
+            .read_to_end(&mut decoded_bytes)
+            .unwrap();
+        String::from_utf8(decoded_bytes).unwrap();
+
         status_server.stop();
     }
 
     #[test]
     fn test_change_log_level() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
-            None,
             ConfigController::default(),
             Arc::new(SecurityConfig::default()),
             MockRouter,
+            temp_dir.path().to_path_buf(),
+            None,
         )
         .unwrap();
         let addr = "127.0.0.1:0".to_owned();
-        let _ = status_server.start(addr.clone(), addr);
+        let _ = status_server.start(addr);
 
         let uri = Uri::builder()
             .scheme("http")
@@ -1499,7 +1546,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let new_log_level = slog::Level::Debug;
+        let new_log_level = slog::Level::Debug.into();
         let mut log_level_request = Request::new(Body::from(
             serde_json::to_string(&LogLevelRequest {
                 log_level: new_log_level,
@@ -1519,7 +1566,7 @@ mod tests {
                 .await
                 .map(move |res| {
                     assert_eq!(res.status(), StatusCode::OK);
-                    assert_eq!(get_log_level(), Some(new_log_level));
+                    assert_eq!(get_log_level(), Some(new_log_level.into()));
                 })
                 .unwrap()
         });

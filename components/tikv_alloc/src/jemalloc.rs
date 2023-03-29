@@ -2,13 +2,14 @@
 
 // The implementation of this crate when jemalloc is turned on
 
-use super::error::{ProfError, ProfResult};
-use crate::AllocStats;
+use std::{collections::HashMap, ptr, slice, sync::Mutex, thread};
+
 use libc::{self, c_char, c_void};
-use std::collections::HashMap;
-use std::{ptr, slice, sync::Mutex, thread};
 use tikv_jemalloc_ctl::{epoch, stats, Error};
 use tikv_jemalloc_sys::malloc_stats_print;
+
+use super::error::{ProfError, ProfResult};
+use crate::AllocStats;
 
 pub type Allocator = tikv_jemallocator::Jemalloc;
 pub const fn allocator() -> Allocator {
@@ -41,8 +42,9 @@ pub fn remove_thread_memory_accessor() {
     thread_memory_map.remove(&thread::current().id());
 }
 
-pub use self::profiling::{activate_prof, deactivate_prof, dump_prof};
 use std::thread::ThreadId;
+
+pub use self::profiling::{activate_prof, deactivate_prof, dump_prof};
 
 pub fn dump_stats() -> String {
     let mut buf = Vec::with_capacity(1024);
@@ -124,10 +126,8 @@ mod profiling {
     const PROF_DUMP: &[u8] = b"prof.dump\0";
 
     pub fn activate_prof() -> ProfResult<()> {
-        info!("start profiler");
         unsafe {
             if let Err(e) = tikv_jemalloc_ctl::raw::update(PROF_ACTIVE, true) {
-                error!("failed to activate profiling: {}", e);
                 return Err(ProfError::JemallocError(format!(
                     "failed to activate profiling: {}",
                     e
@@ -138,10 +138,8 @@ mod profiling {
     }
 
     pub fn deactivate_prof() -> ProfResult<()> {
-        info!("stop profiler");
         unsafe {
             if let Err(e) = tikv_jemalloc_ctl::raw::update(PROF_ACTIVE, false) {
-                error!("failed to deactivate profiling: {}", e);
                 return Err(ProfError::JemallocError(format!(
                     "failed to deactivate profiling: {}",
                     e
@@ -155,25 +153,21 @@ mod profiling {
     pub fn dump_prof(path: &str) -> ProfResult<()> {
         let mut bytes = CString::new(path)?.into_bytes_with_nul();
         let ptr = bytes.as_mut_ptr() as *mut c_char;
-        let res = unsafe { tikv_jemalloc_ctl::raw::write(PROF_DUMP, ptr) };
-        match res {
-            Err(e) => {
-                error!("failed to dump the profile to {:?}: {}", path, e);
-                Err(ProfError::JemallocError(format!(
+        unsafe {
+            if let Err(e) = tikv_jemalloc_ctl::raw::write(PROF_DUMP, ptr) {
+                return Err(ProfError::JemallocError(format!(
                     "failed to dump the profile to {:?}: {}",
                     path, e
-                )))
-            }
-            Ok(_) => {
-                info!("dump profile to {}", path);
-                Ok(())
+                )));
             }
         }
+        Ok(())
     }
 
     #[cfg(test)]
     mod tests {
         use std::fs;
+
         use tempfile::Builder;
 
         const OPT_PROF: &[u8] = b"opt.prof\0";
@@ -198,10 +192,10 @@ mod profiling {
         // TODO: need a test for the dump_prof(None) case, but
         // the cleanup afterward is not simple.
         #[test]
-        #[ignore]
-        fn test_profiling_memory() {
+        #[ignore = "#ifdef MALLOC_CONF"]
+        fn test_profiling_memory_ifdef_malloc_conf() {
             // Make sure somebody has turned on profiling
-            assert!(is_profiling_on(), r#"Set MALLOC_CONF="prof:true""#);
+            assert!(is_profiling_on(), "set MALLOC_CONF=prof:true");
 
             let dir = Builder::new()
                 .prefix("test_profiling_memory")

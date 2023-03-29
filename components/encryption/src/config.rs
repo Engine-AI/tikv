@@ -1,27 +1,27 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use configuration::Configuration;
 use kvproto::encryptionpb::{EncryptionMethod, MasterKeyKms};
+use online_config::OnlineConfig;
 use serde_derive::{Deserialize, Serialize};
 use tikv_util::config::ReadableDuration;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Configuration)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, OnlineConfig)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct EncryptionConfig {
     // Encryption configs.
     #[serde(with = "encryption_method_serde")]
-    #[config(skip)]
+    #[online_config(skip)]
     pub data_encryption_method: EncryptionMethod,
-    #[config(skip)]
+    #[online_config(skip)]
     pub data_key_rotation_period: ReadableDuration,
-    #[config(skip)]
+    #[online_config(skip)]
     pub enable_file_dictionary_log: bool,
-    #[config(skip)]
+    #[online_config(skip)]
     pub file_dictionary_rewrite_threshold: u64,
-    #[config(skip)]
+    #[online_config(skip)]
     pub master_key: MasterKeyConfig,
-    #[config(skip)]
+    #[online_config(skip)]
     pub previous_master_key: MasterKeyConfig,
 }
 
@@ -39,14 +39,14 @@ impl Default for EncryptionConfig {
     }
 }
 
-#[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct FileConfig {
     pub path: String,
 }
 
-#[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq, Eq, Configuration)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq, OnlineConfig)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct KmsConfig {
@@ -68,7 +68,7 @@ impl KmsConfig {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case", tag = "type")]
 pub enum MasterKeyConfig {
     // Store encryption metadata as plaintext. Data still get encrypted. Not allowed to use if
@@ -97,17 +97,21 @@ impl Default for MasterKeyConfig {
 }
 
 mod encryption_method_serde {
-    use super::EncryptionMethod;
     use std::fmt;
 
-    use serde::de::{self, Unexpected, Visitor};
-    use serde::{Deserializer, Serializer};
+    use serde::{
+        de::{self, Unexpected, Visitor},
+        Deserializer, Serializer,
+    };
+
+    use super::EncryptionMethod;
 
     const UNKNOWN: &str = "unknown";
     const PLAINTEXT: &str = "plaintext";
     const AES128_CTR: &str = "aes128-ctr";
     const AES192_CTR: &str = "aes192-ctr";
     const AES256_CTR: &str = "aes256-ctr";
+    const SM4_CTR: &str = "sm4-ctr";
 
     #[allow(clippy::trivially_copy_pass_by_ref)]
     pub fn serialize<S>(method: &EncryptionMethod, serializer: S) -> Result<S::Ok, S::Error>
@@ -120,6 +124,7 @@ mod encryption_method_serde {
             EncryptionMethod::Aes128Ctr => serializer.serialize_str(AES128_CTR),
             EncryptionMethod::Aes192Ctr => serializer.serialize_str(AES192_CTR),
             EncryptionMethod::Aes256Ctr => serializer.serialize_str(AES256_CTR),
+            EncryptionMethod::Sm4Ctr => serializer.serialize_str(SM4_CTR),
         }
     }
 
@@ -132,7 +137,7 @@ mod encryption_method_serde {
         impl<'de> Visitor<'de> for EncryptionMethodVisitor {
             type Value = EncryptionMethod;
 
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write!(formatter, "valid encryption method")
             }
 
@@ -146,6 +151,7 @@ mod encryption_method_serde {
                     AES128_CTR => Ok(EncryptionMethod::Aes128Ctr),
                     AES192_CTR => Ok(EncryptionMethod::Aes192Ctr),
                     AES256_CTR => Ok(EncryptionMethod::Aes256Ctr),
+                    SM4_CTR => Ok(EncryptionMethod::Sm4Ctr),
                     _ => Err(E::invalid_value(Unexpected::Str(value), &self)),
                 }
             }

@@ -6,58 +6,34 @@ edition = "2018"
 publish = false
 
 [features]
-default = ["protobuf-codec", "test-engines-rocksdb", "cloud-aws", "cloud-gcp"]
+default = ["test-engine-kv-rocksdb", "test-engine-raft-raft-engine", "cloud-aws", "cloud-gcp", "cloud-azure"]
 tcmalloc = ["tikv/tcmalloc"]
 jemalloc = ["tikv/jemalloc"]
 mimalloc = ["tikv/mimalloc"]
+snmalloc = ["tikv/snmalloc"]
 portable = ["tikv/portable"]
 sse = ["tikv/sse"]
 mem-profiling = ["tikv/mem-profiling"]
 failpoints = ["tikv/failpoints"]
-bcc-iosnoop = ["tikv/bcc-iosnoop"]
-cloud-aws = [ "encryption_export/cloud-aws" ]
-cloud-gcp = [ "encryption_export/cloud-gcp" ]
-protobuf-codec = [
-  "backup/protobuf-codec",
-  "cdc/protobuf-codec",
-  "concurrency_manager/protobuf-codec",
-  "encryption_export/protobuf-codec",
-  "engine_rocks/protobuf-codec",
-  "engine_traits/protobuf-codec",
-  "error_code/protobuf-codec",
-  "grpcio/protobuf-codec",
-  "keys/protobuf-codec",
-  "kvproto/protobuf-codec",
-  "pd_client/protobuf-codec",
-  "raft/protobuf-codec",
-  "raftstore/protobuf-codec",
-  "raft_log_engine/protobuf-codec",
-  "security/protobuf-codec",
-  "tikv/protobuf-codec",
-  "tikv_util/protobuf-codec",
-  "txn_types/protobuf-codec",
-  "file_system/protobuf-codec",
+cloud-aws = [
+   "encryption_export/cloud-aws",
+   "backup/cloud-aws",
 ]
-prost-codec = [
-  "backup/prost-codec",
-  "cdc/prost-codec",
-  "concurrency_manager/prost-codec",
-  "encryption_export/prost-codec",
-  "engine_rocks/prost-codec",
-  "engine_traits/prost-codec",
-  "error_code/prost-codec",
-  "grpcio/prost-codec",
-  "keys/prost-codec",
-  "kvproto/prost-codec",
-  "pd_client/prost-codec",
-  "raft/prost-codec",
-  "raftstore/prost-codec",
-  "raft_log_engine/prost-codec",
-  "security/prost-codec",
-  "tikv/prost-codec",
-  "tikv_util/prost-codec",
-  "txn_types/prost-codec",
-  "file_system/prost-codec",
+cloud-gcp = [
+  "encryption_export/cloud-gcp",
+  "backup/cloud-gcp",
+]
+cloud-azure = [
+  "encryption_export/cloud-azure",
+  "backup/cloud-azure",
+]
+cloud-storage-grpc = ["backup/cloud-storage-grpc"]
+cloud-storage-dylib = ["backup/cloud-storage-dylib"]
+test-engine-kv-rocksdb = [
+  "tikv/test-engine-kv-rocksdb"
+]
+test-engine-raft-raft-engine = [
+  "tikv/test-engine-raft-raft-engine"
 ]
 test-engines-rocksdb = [
   "tikv/test-engines-rocksdb",
@@ -69,52 +45,53 @@ test-engines-panic = [
 nortcheck = ["engine_rocks/nortcheck"]
 
 [dependencies]
-backup = { path = "../../components/backup", default-features = false }
-cdc = { path = "../../components/cdc", default-features = false }
+backup = { workspace = true }
+cdc = { workspace = true }
 chrono = "0.4"
-crossbeam = "0.8"
-tempfile = "3.0"
 clap = "2.32"
-concurrency_manager = { path = "../../components/concurrency_manager", default-features = false }
-encryption_export = { path = "../../components/encryption/export", default-features = false }
-engine_rocks = { path = "../../components/engine_rocks", default-features = false }
-engine_traits = { path = "../../components/engine_traits", default-features = false }
-error_code = { path = "../../components/error_code", default-features = false }
-file_system = { path = "../../components/file_system", default-features = false }
-fs2 = "0.4"
+collections = { workspace = true }
+concurrency_manager = { workspace = true }
+crossbeam = "0.8"
+encryption_export = { workspace = true }
+engine_rocks = { workspace = true }
+engine_traits = { workspace = true }
+error_code = { workspace = true }
+file_system = { workspace = true }
 futures = "0.3"
-tokio = { version = "0.2", features = ["rt-threaded", "time"] }
-grpcio = { version = "0.8",  default-features = false, features = ["openssl-vendored"] }
+gag = "1.0"
+grpcio = { workspace = true }
 hex = "0.4"
-keys = { path = "../../components/keys", default-features = false }
-kvproto = { git = "https://github.com/pingcap/kvproto.git", default-features = false }
+keys = { workspace = true }
+kvproto = { workspace = true }
 libc = "0.2"
 log = { version = "0.4", features = ["max_level_trace", "release_max_level_debug"] }
-log_wrappers = { path = "../../components/log_wrappers" }
-nix = "0.19"
-pd_client = { path = "../../components/pd_client", default-features = false }
-prometheus = { version = "0.10", features = ["nightly"] }
-promptly = "0.3.0"
-protobuf = "2.8"
-raft = { version = "0.6.0-alpha", default-features = false }
-raft_log_engine = { path = "../../components/raft_log_engine", default-features = false }
-raftstore = { path = "../../components/raftstore", default-features = false }
-rand = "0.7"
-security = { path = "../../components/security", default-features = false }
+log_wrappers = { workspace = true }
+pd_client = { workspace = true }
+prometheus = { version = "0.13", features = ["nightly"] }
+protobuf = { version = "2.8", features = ["bytes"] }
+raft = { version = "0.7.0", default-features = false, features = ["protobuf-codec"] }
+raft-engine-ctl = { git = "https://github.com/tikv/raft-engine.git" }
+raft_log_engine = { workspace = true }
+raftstore = { workspace = true }
+rand = "0.8"
+regex = "1"
+security = { workspace = true }
 serde_json = "1.0"
-slog = { version = "2.3", features = ["max_level_trace", "release_max_level_debug"] }
-slog-global = { version = "0.1", git = "https://github.com/breeswish/slog-global.git", rev = "d592f88e4dbba5eb439998463054f1a44fbf17b9" }
-tikv = { path = "../../", default-features = false }
-tikv_alloc = { path = "../../components/tikv_alloc" }
-tikv_util = { path = "../../components/tikv_util", default-features = false }
-collections = { path = "../../components/collections" }
+server = { workspace = true }
+slog = { workspace = true }
+slog-global = { workspace = true }
+structopt = "0.3"
+tempfile = "3.0"
+tikv = { workspace = true }
+tikv_alloc = { workspace = true }
+tikv_util = { workspace = true }
+tokio = { version = "1.5", features = ["rt-multi-thread", "time"] }
 toml = "0.5"
-txn_types = { path = "../../components/txn_types", default-features = false }
-vlog = "0.1.4"
-yatp = { git = "https://github.com/tikv/yatp.git", branch = "master" }
+txn_types = { workspace = true }
 
 [build-dependencies]
+cc = "1.0"
 time = "0.1"
 
 [target.'cfg(unix)'.dependencies]
-signal = "0.6"
+signal-hook = "0.3"

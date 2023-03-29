@@ -2,11 +2,13 @@
 
 #![feature(test)]
 
+use std::{borrow::Cow, hint::black_box, mem::forget};
+
 use concurrency_manager::ConcurrencyManager;
 use criterion::*;
 use futures::executor::block_on;
+use kvproto::kvrpcpb::IsolationLevel;
 use rand::prelude::*;
-use std::{borrow::Cow, hint::black_box, mem::forget};
 use txn_types::{Key, Lock, LockType, TsSet};
 
 const KEY_LEN: usize = 64;
@@ -58,7 +60,13 @@ fn bench_point_check(c: &mut Criterion) {
             thread_rng().fill_bytes(&mut buf[..]);
             let key = Key::from_raw(&buf);
             let _ = cm.read_key_check(&key, |l| {
-                Lock::check_ts_conflict(Cow::Borrowed(&l), &key, 1.into(), &ts_set)
+                Lock::check_ts_conflict(
+                    Cow::Borrowed(l),
+                    &key,
+                    1.into(),
+                    &ts_set,
+                    IsolationLevel::Si,
+                )
             });
         })
     });
@@ -67,7 +75,7 @@ fn bench_point_check(c: &mut Criterion) {
 fn range_check_baseline(c: &mut Criterion) {
     c.bench_function("range_check_baseline", |b| {
         b.iter(|| {
-            let start = thread_rng().gen_range(0u8, 245);
+            let start = thread_rng().gen_range(0u8..245);
             black_box(Key::from_raw(&[start]));
             black_box(Key::from_raw(&[start + 25]));
         })
@@ -79,12 +87,18 @@ fn bench_range_check(c: &mut Criterion) {
     let ts_set = TsSet::Empty;
     c.bench_function("range_check_1k_in_10k_locks", |b| {
         b.iter(|| {
-            let start = thread_rng().gen_range(0u8, 230);
+            let start = thread_rng().gen_range(0u8..230);
             let start_key = Key::from_raw(&[start]);
             let end_key = Key::from_raw(&[start + 25]);
             // The key range is roughly 1/10 the key space.
             let _ = cm.read_range_check(Some(&start_key), Some(&end_key), |key, l| {
-                Lock::check_ts_conflict(Cow::Borrowed(&l), &key, 1.into(), &ts_set)
+                Lock::check_ts_conflict(
+                    Cow::Borrowed(l),
+                    key,
+                    1.into(),
+                    &ts_set,
+                    IsolationLevel::Si,
+                )
             });
         })
     });

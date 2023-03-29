@@ -1,14 +1,19 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use prometheus::*;
-use prometheus_static_metric::*;
+use std::{
+    cell::{Cell, RefCell},
+    time::Duration,
+};
 
-use crate::storage::ErrorHeaderKind;
-use prometheus::exponential_buckets;
+use collections::HashMap;
+use prometheus::{exponential_buckets, local::LocalIntCounter, *};
+use prometheus_static_metric::*;
+use tikv_util::time::Instant;
 
 pub use crate::storage::kv::metrics::{
     GcKeysCF, GcKeysCounterVec, GcKeysCounterVecInner, GcKeysDetail,
 };
+use crate::storage::ErrorHeaderKind;
 
 make_auto_flush_static_metric! {
     pub label_enum GrpcTypeKind {
@@ -30,6 +35,8 @@ make_auto_flush_static_metric! {
         kv_resolve_lock,
         kv_gc,
         kv_delete_range,
+        kv_prepare_flashback_to_version,
+        kv_flashback_to_version,
         raw_get,
         raw_batch_get,
         raw_batch_get_command,
@@ -42,20 +49,14 @@ make_auto_flush_static_metric! {
         raw_batch_delete,
         raw_get_key_ttl,
         raw_compare_and_swap,
-        ver_get,
-        ver_batch_get,
-        ver_mut,
-        ver_batch_mut,
-        ver_scan,
-        ver_delete_range,
+        raw_checksum,
         unsafe_destroy_range,
-        physical_scan_lock,
         register_lock_observer,
         check_lock_observer,
         remove_lock_observer,
         coprocessor,
         coprocessor_stream,
-        coprocessor_v2,
+        raw_coprocessor,
         mvcc_get_by_key,
         mvcc_get_by_start_ts,
         split_region,
@@ -67,8 +68,8 @@ make_auto_flush_static_metric! {
     pub label_enum GcCommandKind {
         gc,
         gc_keys,
+        raw_gc_keys,
         unsafe_destroy_range,
-        physical_scan_lock,
         validate_config,
         orphan_versions,
     }
@@ -101,6 +102,10 @@ make_auto_flush_static_metric! {
     }
 
     pub struct SnapTaskCounterVec: LocalIntCounter {
+        "type" => SnapTask,
+    }
+
+    pub struct SnapLimitTransportBytesVec:LocalIntCounter{
         "type" => SnapTask,
     }
 
@@ -140,9 +145,8 @@ make_static_metric! {
     }
 
     pub label_enum BatchableRequestKind {
-        point_get,
-        prewrite,
-        commit,
+        kv_get,
+        raw_get,
     }
 
     pub struct GrpcMsgHistogramGlobal: Histogram {
@@ -153,8 +157,16 @@ make_static_metric! {
         "type" => BatchableRequestKind,
     }
 
-    pub struct RequestBatchRatioHistogramVec: Histogram {
-        "type" => BatchableRequestKind,
+    pub label_enum FlushReason {
+        full,
+        full_after_delay,
+        delay,
+        eof,
+        wake,
+    }
+
+    pub struct RaftMessageFlushCounterVec: IntCounter {
+        "reason" => FlushReason,
     }
 }
 
@@ -195,6 +207,12 @@ lazy_static! {
         &["type"]
     )
     .unwrap();
+    pub static ref GRPC_RESOURCE_GROUP_COUNTER_VEC: IntCounterVec = register_int_counter_vec!(
+        "tikv_grpc_resource_group_total",
+        "Total number of handle grpc message for each resource group",
+        &["name"]
+    )
+    .unwrap();
     pub static ref GRPC_PROXY_MSG_COUNTER_VEC: IntCounterVec = register_int_counter_vec!(
         "tikv_grpc_proxy_msg_total",
         "Total number of handle grpc proxy message",
@@ -204,14 +222,18 @@ lazy_static! {
     pub static ref GC_KEYS_COUNTER_VEC: IntCounterVec = register_int_counter_vec!(
         "tikv_gcworker_gc_keys",
         "Counter of keys affected during gc",
-        &["cf", "tag"]
+        &["key_mode", "cf", "tag"]
     )
     .unwrap();
+    pub static ref GC_KEY_FAILURES: IntCounter = register_int_counter!(
+        "tikv_gcworker_gc_key_failures",
+        "Counter of gc key failures"
+    ).unwrap();
     pub static ref GRPC_MSG_HISTOGRAM_VEC: HistogramVec = register_histogram_vec!(
         "tikv_grpc_msg_duration_seconds",
         "Bucketed histogram of grpc server messages",
         &["type"],
-        exponential_buckets(0.0005, 2.0, 20).unwrap()
+        exponential_buckets(5e-5, 2.0, 22).unwrap() // 50us ~ 104s
     )
     .unwrap();
     pub static ref SERVER_INFO_GAUGE_VEC: IntGaugeVec = register_int_gauge_vec!(
@@ -226,6 +248,25 @@ lazy_static! {
             "Duration of memory lock checking for replica read",
             &["result"],
             exponential_buckets(1e-6f64, 4f64, 10).unwrap() // 1us ~ 262ms
+        )
+        .unwrap();
+    pub static ref ADDRESS_RESOLVE_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_server_address_resolve_duration_secs",
+            "Duration of resolving store address",
+            exponential_buckets(0.0001, 2.0, 20).unwrap()
+        )
+        .unwrap();
+    pub static ref GRPC_REQUEST_SOURCE_COUNTER_VEC: IntCounterVec = register_int_counter_vec!(
+            "tikv_grpc_request_source_counter_vec",
+            "Counter of different sources of RPC requests",
+            &["source"]
+        )
+        .unwrap();
+    pub static ref GRPC_REQUEST_SOURCE_DURATION_VEC: IntCounterVec = register_int_counter_vec!(
+            "tikv_grpc_request_source_duration_vec",
+            "Total duration of different sources of RPC requests (in microseconds)",
+            &["source"]
         )
         .unwrap();
 }
@@ -254,6 +295,10 @@ lazy_static! {
     pub static ref REPLICA_READ_LOCK_CHECK_HISTOGRAM_VEC_STATIC: ReplicaReadLockCheckHistogramVec = auto_flush_from!(
         REPLICA_READ_LOCK_CHECK_HISTOGRAM_VEC,
         ReplicaReadLockCheckHistogramVec
+    );
+    pub static ref SNAP_LIMIT_TRANSPORT_BYTES_COUNTER_STATIC: SnapLimitTransportBytesVec = auto_flush_from!(
+        SNAP_LIMIT_TRANSPORT_BYTES_COUNTER,
+        SnapLimitTransportBytesVec
     );
 }
 
@@ -290,7 +335,7 @@ lazy_static! {
         "tikv_gcworker_gc_task_duration_vec",
         "Duration of gc tasks execution",
         &["task"],
-        exponential_buckets(0.0005, 2.0, 20).unwrap()
+        exponential_buckets(0.00001, 2.0, 26).unwrap()
     )
     .unwrap();
     pub static ref GC_TOO_BUSY_COUNTER: IntCounter = register_int_counter!(
@@ -329,7 +374,7 @@ lazy_static! {
     pub static ref TTL_CHECKER_COMPACT_DURATION_HISTOGRAM: Histogram = register_histogram!(
         "tikv_ttl_checker_compact_duration",
         "Duration of ttl checker compact files execution",
-        exponential_buckets(0.0005, 2.0, 20).unwrap()
+        exponential_buckets(0.00001, 2.0, 26).unwrap()
     )
     .unwrap();
     pub static ref TTL_CHECKER_POLL_INTERVAL_GAUGE: IntGauge = register_int_gauge!(
@@ -354,16 +399,14 @@ lazy_static! {
         &["type", "store_id"]
     )
     .unwrap();
-    pub static ref RAFT_MESSAGE_FLUSH_COUNTER: IntCounter = register_int_counter!(
-        "tikv_server_raft_message_flush_total",
-        "Total number of raft messages flushed immediately"
-    )
-    .unwrap();
-    pub static ref RAFT_MESSAGE_DELAY_FLUSH_COUNTER: IntCounter = register_int_counter!(
-        "tikv_server_raft_message_delay_flush_total",
-        "Total number of raft messages flushed delay"
-    )
-    .unwrap();
+    pub static ref RAFT_MESSAGE_FLUSH_COUNTER: RaftMessageFlushCounterVec =
+        register_static_int_counter_vec!(
+            RaftMessageFlushCounterVec,
+            "tikv_server_raft_message_flush_total",
+            "Total number of raft messages flushed immediately",
+            &["reason"]
+        )
+        .unwrap();
     pub static ref CONFIG_ROCKSDB_GAUGE: GaugeVec = register_gauge_vec!(
         "tikv_config_rocksdb",
         "Config information of rocksdb",
@@ -376,21 +419,31 @@ lazy_static! {
             "tikv_server_request_batch_size",
             "Size of request batch input",
             &["type"],
-            exponential_buckets(1f64, 5f64, 10).unwrap()
-        )
-        .unwrap();
-    pub static ref REQUEST_BATCH_RATIO_HISTOGRAM_VEC: RequestBatchRatioHistogramVec =
-        register_static_histogram_vec!(
-            RequestBatchRatioHistogramVec,
-            "tikv_server_request_batch_ratio",
-            "Ratio of request batch output to input",
-            &["type"],
-            exponential_buckets(1f64, 5f64, 10).unwrap()
+            vec![1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0, 32.0, 64.0]
         )
         .unwrap();
     pub static ref CPU_CORES_QUOTA_GAUGE: Gauge = register_gauge!(
         "tikv_server_cpu_cores_quota",
         "Total CPU cores quota for TiKV server"
+    )
+    .unwrap();
+    pub static ref MEM_TRACE_SUM_GAUGE: IntGaugeVec = register_int_gauge_vec!(
+        "tikv_server_mem_trace_sum",
+        "The sum of memory trace for TiKV server",
+        &["name"]
+    )
+    .unwrap();
+    pub static ref MEMORY_USAGE_GAUGE: IntGauge =
+        register_int_gauge!("tikv_server_memory_usage", "Memory usage for the instance").unwrap();
+    pub static ref RAFT_APPEND_REJECTS: IntCounter = register_int_counter!(
+        "tikv_server_raft_append_rejects",
+        "Count for rejected Raft append messages"
+    )
+    .unwrap();
+    pub static ref SNAP_LIMIT_TRANSPORT_BYTES_COUNTER: IntCounterVec = register_int_counter_vec!(
+        "tikv_snapshot_limit_transport_bytes",
+        "Total snapshot limit transport used",
+        &["type"],
     )
     .unwrap();
 }
@@ -459,7 +512,7 @@ lazy_static! {
         "tikv_storage_engine_async_request_duration_seconds",
         "Bucketed histogram of processing successful asynchronous requests.",
         &["type"],
-        exponential_buckets(0.0005, 2.0, 20).unwrap()
+        exponential_buckets(0.00001, 2.0, 26).unwrap()
     )
     .unwrap();
 }
@@ -469,4 +522,52 @@ lazy_static! {
         auto_flush_from!(ASYNC_REQUESTS_COUNTER, AsyncRequestsCounterVec);
     pub static ref ASYNC_REQUESTS_DURATIONS_VEC: AsyncRequestsDurationVec =
         auto_flush_from!(ASYNC_REQUESTS_DURATIONS, AsyncRequestsDurationVec);
+}
+
+struct LocalRequestSourceMetrics {
+    pub count: LocalIntCounter,
+    pub duration_us: LocalIntCounter,
+}
+
+impl LocalRequestSourceMetrics {
+    fn new(source: &str) -> Self {
+        LocalRequestSourceMetrics {
+            count: GRPC_REQUEST_SOURCE_COUNTER_VEC
+                .with_label_values(&[source])
+                .local(),
+            duration_us: GRPC_REQUEST_SOURCE_DURATION_VEC
+                .with_label_values(&[source])
+                .local(),
+        }
+    }
+}
+
+thread_local! {
+    static REQUEST_SOURCE_METRICS_MAP: RefCell<HashMap<String, LocalRequestSourceMetrics>> = RefCell::new(HashMap::default());
+
+    static LAST_LOCAL_FLUSH_TIME: Cell<Instant> = Cell::new(Instant::now_coarse());
+}
+
+pub fn record_request_source_metrics(source: String, duration: Duration) {
+    let need_flush = LAST_LOCAL_FLUSH_TIME.with(|last_local_flush_time| {
+        let now = Instant::now_coarse();
+        if now - last_local_flush_time.get() > Duration::from_secs(1) {
+            last_local_flush_time.set(now);
+            true
+        } else {
+            false
+        }
+    });
+    REQUEST_SOURCE_METRICS_MAP.with(|map| {
+        let mut map = map.borrow_mut();
+        let metrics = map
+            .entry(source)
+            .or_insert_with_key(|k| LocalRequestSourceMetrics::new(k));
+        metrics.count.inc();
+        metrics.duration_us.inc_by(duration.as_micros() as u64);
+        if need_flush {
+            metrics.count.flush();
+            metrics.duration_us.flush();
+        }
+    });
 }

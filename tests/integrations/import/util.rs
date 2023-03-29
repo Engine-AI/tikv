@@ -1,28 +1,25 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+use std::{sync::Arc, thread, time::Duration};
 
-use futures::executor::block_on;
-use futures::{stream, SinkExt};
+use futures::{executor::block_on, stream, SinkExt};
 use grpcio::{ChannelBuilder, Environment, Result, WriteFlags};
-use kvproto::import_sstpb::*;
-use kvproto::kvrpcpb::*;
-use kvproto::tikvpb::*;
+use kvproto::{import_sstpb::*, kvrpcpb::*, tikvpb::*};
 use security::SecurityConfig;
-use uuid::Uuid;
-
 use test_raftstore::*;
-use tikv::config::TiKvConfig;
+use tikv::config::TikvConfig;
 use tikv_util::HandyRwLock;
+use uuid::Uuid;
 
 const CLEANUP_SST_MILLIS: u64 = 10;
 
-pub fn new_cluster(cfg: TiKvConfig) -> (Cluster<ServerCluster>, Context) {
+pub fn new_cluster(cfg: TikvConfig) -> (Cluster<ServerCluster>, Context) {
     let count = 1;
     let mut cluster = new_server_cluster(0, count);
-    cluster.cfg = cfg;
+    cluster.cfg = Config {
+        tikv: cfg,
+        prefer_mem: true,
+    };
     cluster.run();
 
     let region_id = 1;
@@ -37,10 +34,11 @@ pub fn new_cluster(cfg: TiKvConfig) -> (Cluster<ServerCluster>, Context) {
 }
 
 pub fn open_cluster_and_tikv_import_client(
-    cfg: Option<TiKvConfig>,
+    cfg: Option<TikvConfig>,
 ) -> (Cluster<ServerCluster>, Context, TikvClient, ImportSstClient) {
     let cfg = cfg.unwrap_or_else(|| {
-        let mut config = TiKvConfig::default();
+        let mut config = TikvConfig::default();
+        config.server.addr = "127.0.0.1:0".to_owned();
         let cleanup_interval = Duration::from_millis(CLEANUP_SST_MILLIS);
         config.raft_store.cleanup_import_sst_interval.0 = cleanup_interval;
         config.server.grpc_concurrency = 1;
@@ -86,7 +84,8 @@ pub fn new_cluster_and_tikv_import_client_tde() -> (
     let encryption_cfg = test_util::new_file_security_config(&tmp_dir);
     let mut security = test_util::new_security_cfg(None);
     security.encryption = encryption_cfg;
-    let mut config = TiKvConfig::default();
+    let mut config = TikvConfig::default();
+    config.server.addr = "127.0.0.1:0".to_owned();
     let cleanup_interval = Duration::from_millis(CLEANUP_SST_MILLIS);
     config.raft_store.cleanup_import_sst_interval.0 = cleanup_interval;
     config.server.grpc_concurrency = 1;
@@ -133,15 +132,7 @@ pub fn send_write_sst(
     commit_ts: u64,
 ) -> Result<WriteResponse> {
     let mut r1 = WriteRequest::default();
-    // TODO rewrite following code blocks with cfg-if.
-    #[cfg(feature = "prost-codec")]
-    {
-        r1.chunk = Some(write_request::Chunk::Meta(meta.clone()));
-    }
-    #[cfg(not(feature = "prost-codec"))]
-    {
-        r1.set_meta(meta.clone());
-    }
+    r1.set_meta(meta.clone());
     let mut r2 = WriteRequest::default();
 
     let mut batch = WriteBatch::default();
@@ -155,14 +146,7 @@ pub fn send_write_sst(
     }
     batch.set_commit_ts(commit_ts);
     batch.set_pairs(pairs.into());
-    #[cfg(feature = "prost-codec")]
-    {
-        r2.chunk = Some(write_request::Chunk::Batch(batch));
-    }
-    #[cfg(not(feature = "prost-codec"))]
-    {
-        r2.set_batch(batch);
-    }
+    r2.set_batch(batch);
 
     let reqs: Vec<_> = vec![r1, r2]
         .into_iter()
@@ -179,10 +163,15 @@ pub fn send_write_sst(
 }
 
 pub fn check_ingested_kvs(tikv: &TikvClient, ctx: &Context, sst_range: (u8, u8)) {
+    check_ingested_kvs_cf(tikv, ctx, "", sst_range);
+}
+
+pub fn check_ingested_kvs_cf(tikv: &TikvClient, ctx: &Context, cf: &str, sst_range: (u8, u8)) {
     for i in sst_range.0..sst_range.1 {
         let mut m = RawGetRequest::default();
         m.set_context(ctx.clone());
         m.set_key(vec![i]);
+        m.set_cf(cf.to_owned());
         let resp = tikv.raw_get(&m).unwrap();
         assert!(resp.get_error().is_empty());
         assert!(!resp.has_region_error());

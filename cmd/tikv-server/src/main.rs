@@ -2,12 +2,15 @@
 
 #![feature(proc_macro_hygiene)]
 
-use std::path::Path;
-use std::process;
+use std::{path::Path, process};
 
 use clap::{crate_authors, App, Arg};
+use serde_json::{Map, Value};
 use server::setup::{ensure_no_unrecognized_config, validate_and_persist_config};
-use tikv::config::TiKvConfig;
+use tikv::{
+    config::{to_flatten_config_info, TikvConfig},
+    storage::config::EngineType,
+};
 
 fn main() {
     let build_timestamp = option_env!("TIKV_BUILD_TIME");
@@ -34,6 +37,15 @@ fn main() {
                 .help("Check config file validity and exit"),
         )
         .arg(
+            Arg::with_name("config-info")
+                .required(false)
+                .long("config-info")
+                .takes_value(true)
+                .value_name("FORMAT")
+                .possible_values(&["json"])
+                .help("print configuration information with specified format")
+        )
+        .arg(
             Arg::with_name("log-level")
                 .short("L")
                 .long("log-level")
@@ -41,7 +53,7 @@ fn main() {
                 .takes_value(true)
                 .value_name("LEVEL")
                 .possible_values(&[
-                    "trace", "debug", "info", "warn", "warning", "error", "critical",
+                    "trace", "debug", "info", "warn", "warning", "error", "critical", "fatal",
                 ])
                 .help("Set the log level"),
         )
@@ -148,7 +160,7 @@ fn main() {
         .get_matches();
 
     if matches.is_present("print-sample-config") {
-        let config = TiKvConfig::default();
+        let config = TikvConfig::default();
         println!("{}", toml::to_string_pretty(&config).unwrap());
         process::exit(0);
     }
@@ -158,18 +170,27 @@ fn main() {
 
     let mut config = matches
         .value_of_os("config")
-        .map_or_else(TiKvConfig::default, |path| {
-            TiKvConfig::from_file(
-                Path::new(path),
+        .map_or_else(TikvConfig::default, |path| {
+            let path = Path::new(path);
+            TikvConfig::from_file(
+                path,
                 if is_config_check {
                     Some(&mut unrecognized_keys)
                 } else {
                     None
                 },
             )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "invalid auto generated configuration file {}, err {}",
+                    path.display(),
+                    e
+                );
+            })
         });
 
     server::setup::overwrite_config_with_cmd_args(&mut config, &matches);
+    config.logger_compatible_adjust();
 
     if is_config_check {
         validate_and_persist_config(&mut config, false);
@@ -178,5 +199,19 @@ fn main() {
         process::exit(0)
     }
 
-    server::server::run_tikv(config);
+    let is_config_info = matches.is_present("config-info");
+    if is_config_info {
+        let config_infos = to_flatten_config_info(&config);
+        let mut result = Map::new();
+        result.insert("Component".into(), "TiKV Server".into());
+        result.insert("Version".into(), tikv::tikv_build_version().into());
+        result.insert("Parameters".into(), Value::Array(config_infos));
+        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        process::exit(0);
+    }
+
+    match config.storage.engine {
+        EngineType::RaftKv => server::server::run_tikv(config),
+        EngineType::RaftKv2 => server::server2::run_tikv(config),
+    }
 }

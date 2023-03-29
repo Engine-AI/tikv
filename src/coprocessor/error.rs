@@ -1,12 +1,16 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::storage;
-use crate::storage::kv::{Error as KvError, ErrorInner as KvErrorInner};
-use crate::storage::mvcc::{Error as MvccError, ErrorInner as MvccErrorInner};
-use crate::storage::txn::{Error as TxnError, ErrorInner as TxnErrorInner};
-
 use error_code::{self, ErrorCode, ErrorCodeExt};
 use thiserror::Error;
+
+use crate::{
+    storage,
+    storage::{
+        kv::{Error as KvError, ErrorInner as KvErrorInner},
+        mvcc::{Error as MvccError, ErrorInner as MvccErrorInner},
+        txn::{Error as TxnError, ErrorInner as TxnErrorInner},
+    },
+};
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -69,6 +73,7 @@ impl From<KvError> for Error {
     fn from(err: KvError) -> Self {
         match err {
             KvError(box KvErrorInner::Request(e)) => Error::Region(e),
+            KvError(box KvErrorInner::KeyIsLocked(lock_info)) => Error::Locked(lock_info),
             e => Error::Other(e.to_string()),
         }
     }
@@ -78,7 +83,7 @@ impl From<MvccError> for Error {
     fn from(err: MvccError) -> Self {
         match err {
             MvccError(box MvccErrorInner::KeyIsLocked(info)) => Error::Locked(info),
-            MvccError(box MvccErrorInner::Engine(engine_error)) => Error::from(engine_error),
+            MvccError(box MvccErrorInner::Kv(kv_error)) => Error::from(kv_error),
             e => Error::Other(e.to_string()),
         }
     }
@@ -88,7 +93,7 @@ impl From<TxnError> for Error {
     fn from(err: storage::txn::Error) -> Self {
         match err {
             TxnError(box TxnErrorInner::Mvcc(mvcc_error)) => Error::from(mvcc_error),
-            TxnError(box TxnErrorInner::Engine(engine_error)) => Error::from(engine_error),
+            TxnError(box TxnErrorInner::Engine(kv_error)) => Error::from(kv_error),
             e => Error::Other(e.to_string()),
         }
     }

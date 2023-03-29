@@ -2,19 +2,24 @@
 
 mod storage_impl;
 
-pub use self::storage_impl::TiKVStorage;
+use std::{marker::PhantomData, sync::Arc};
 
+use api_version::KvFormat;
 use async_trait::async_trait;
 use kvproto::coprocessor::{KeyRange, Response};
 use protobuf::Message;
-use tidb_query_common::storage::IntervalRange;
+use tidb_query_common::{execute_stats::ExecSummary, storage::IntervalRange};
+use tikv_alloc::trace::MemoryTraceGuard;
 use tipb::{DagRequest, SelectResponse, StreamResponse};
 
-use crate::coprocessor::metrics::*;
-use crate::coprocessor::{Deadline, RequestHandler, Result};
-use crate::storage::{Statistics, Store};
+pub use self::storage_impl::TikvStorage;
+use crate::{
+    coprocessor::{metrics::*, Deadline, RequestHandler, Result},
+    storage::{Statistics, Store},
+    tikv_util::quota_limiter::QuotaLimiter,
+};
 
-pub struct DagHandlerBuilder<S: Store + 'static> {
+pub struct DagHandlerBuilder<S: Store + 'static, F: KvFormat> {
     req: DagRequest,
     ranges: Vec<KeyRange>,
     store: S,
@@ -23,9 +28,12 @@ pub struct DagHandlerBuilder<S: Store + 'static> {
     batch_row_limit: usize,
     is_streaming: bool,
     is_cache_enabled: bool,
+    paging_size: Option<u64>,
+    quota_limiter: Arc<QuotaLimiter>,
+    _phantom: PhantomData<F>,
 }
 
-impl<S: Store + 'static> DagHandlerBuilder<S> {
+impl<S: Store + 'static, F: KvFormat> DagHandlerBuilder<S, F> {
     pub fn new(
         req: DagRequest,
         ranges: Vec<KeyRange>,
@@ -34,6 +42,8 @@ impl<S: Store + 'static> DagHandlerBuilder<S> {
         batch_row_limit: usize,
         is_streaming: bool,
         is_cache_enabled: bool,
+        paging_size: Option<u64>,
+        quota_limiter: Arc<QuotaLimiter>,
     ) -> Self {
         DagHandlerBuilder {
             req,
@@ -44,9 +54,13 @@ impl<S: Store + 'static> DagHandlerBuilder<S> {
             batch_row_limit,
             is_streaming,
             is_cache_enabled,
+            paging_size,
+            quota_limiter,
+            _phantom: PhantomData,
         }
     }
 
+    #[must_use]
     pub fn data_version(mut self, data_version: Option<u64>) -> Self {
         self.data_version = data_version;
         self
@@ -54,7 +68,7 @@ impl<S: Store + 'static> DagHandlerBuilder<S> {
 
     pub fn build(self) -> Result<Box<dyn RequestHandler>> {
         COPR_DAG_REQ_COUNT.with_label_values(&["batch"]).inc();
-        Ok(BatchDAGHandler::new(
+        Ok(BatchDagHandler::new::<_, F>(
             self.req,
             self.ranges,
             self.store,
@@ -63,18 +77,20 @@ impl<S: Store + 'static> DagHandlerBuilder<S> {
             self.is_cache_enabled,
             self.batch_row_limit,
             self.is_streaming,
+            self.paging_size,
+            self.quota_limiter,
         )?
         .into_boxed())
     }
 }
 
-pub struct BatchDAGHandler {
+pub struct BatchDagHandler {
     runner: tidb_query_executors::runner::BatchExecutorsRunner<Statistics>,
     data_version: Option<u64>,
 }
 
-impl BatchDAGHandler {
-    pub fn new<S: Store + 'static>(
+impl BatchDagHandler {
+    pub fn new<S: Store + 'static, F: KvFormat>(
         req: DagRequest,
         ranges: Vec<KeyRange>,
         store: S,
@@ -83,15 +99,19 @@ impl BatchDAGHandler {
         is_cache_enabled: bool,
         streaming_batch_limit: usize,
         is_streaming: bool,
+        paging_size: Option<u64>,
+        quota_limiter: Arc<QuotaLimiter>,
     ) -> Result<Self> {
         Ok(Self {
-            runner: tidb_query_executors::runner::BatchExecutorsRunner::from_request(
+            runner: tidb_query_executors::runner::BatchExecutorsRunner::from_request::<_, F>(
                 req,
                 ranges,
-                TiKVStorage::new(store, is_cache_enabled),
+                TikvStorage::new(store, is_cache_enabled),
                 deadline,
                 streaming_batch_limit,
                 is_streaming,
+                paging_size,
+                quota_limiter,
             )?,
             data_version,
         })
@@ -99,31 +119,39 @@ impl BatchDAGHandler {
 }
 
 #[async_trait]
-impl RequestHandler for BatchDAGHandler {
-    async fn handle_request(&mut self) -> Result<Response> {
+impl RequestHandler for BatchDagHandler {
+    async fn handle_request(&mut self) -> Result<MemoryTraceGuard<Response>> {
         let result = self.runner.handle_request().await;
-        handle_qe_response(result, self.runner.can_be_cached(), self.data_version)
+        handle_qe_response(result, self.runner.can_be_cached(), self.data_version).map(|x| x.into())
     }
 
-    fn handle_streaming_request(&mut self) -> Result<(Option<Response>, bool)> {
-        handle_qe_stream_response(self.runner.handle_streaming_request())
+    async fn handle_streaming_request(&mut self) -> Result<(Option<Response>, bool)> {
+        handle_qe_stream_response(self.runner.handle_streaming_request().await)
     }
 
     fn collect_scan_statistics(&mut self, dest: &mut Statistics) {
         self.runner.collect_storage_stats(dest);
     }
+
+    fn collect_scan_summary(&mut self, dest: &mut ExecSummary) {
+        self.runner.collect_scan_summary(dest);
+    }
 }
 
 fn handle_qe_response(
-    result: tidb_query_common::Result<SelectResponse>,
+    result: tidb_query_common::Result<(SelectResponse, Option<IntervalRange>)>,
     can_be_cached: bool,
     data_version: Option<u64>,
 ) -> Result<Response> {
     use tidb_query_common::error::ErrorInner;
 
     match result {
-        Ok(sel_resp) => {
+        Ok((sel_resp, range)) => {
             let mut resp = Response::default();
+            if let Some(range) = range {
+                resp.mut_range().set_start(range.lower_inclusive);
+                resp.mut_range().set_end(range.upper_exclusive);
+            }
             resp.set_data(box_try!(sel_resp.write_to_bytes()));
             resp.set_can_be_cached(can_be_cached);
             resp.set_is_cache_hit(false);

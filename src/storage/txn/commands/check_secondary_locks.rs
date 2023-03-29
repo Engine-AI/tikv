@@ -1,19 +1,23 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::storage::kv::WriteData;
-use crate::storage::lock_manager::LockManager;
-use crate::storage::mvcc::{LockType, MvccTxn, SnapshotReader, TimeStamp, TxnCommitRecord};
-use crate::storage::txn::{
-    actions::check_txn_status::{collapse_prev_rollback, make_rollback},
-    commands::{
-        Command, CommandExt, ReleasedLocks, ResponsePolicy, TypedCommand, WriteCommand,
-        WriteContext, WriteResult,
-    },
-    Result,
-};
-use crate::storage::types::SecondaryLocksStatus;
-use crate::storage::{ProcessResult, Snapshot};
+// #[PerformanceCriticalPath]
 use txn_types::{Key, Lock, WriteType};
+
+use crate::storage::{
+    kv::WriteData,
+    lock_manager::LockManager,
+    mvcc::{LockType, MvccTxn, SnapshotReader, TimeStamp, TxnCommitRecord},
+    txn::{
+        actions::check_txn_status::{collapse_prev_rollback, make_rollback},
+        commands::{
+            Command, CommandExt, ReaderWithStats, ReleasedLocks, ResponsePolicy, TypedCommand,
+            WriteCommand, WriteContext, WriteResult,
+        },
+        Result,
+    },
+    types::SecondaryLocksStatus,
+    ProcessResult, Snapshot,
+};
 
 command! {
     /// Check secondary locks of an async commit transaction.
@@ -25,7 +29,7 @@ command! {
     /// status being changed, a rollback may be written.
     CheckSecondaryLocks:
         cmd_ty => SecondaryLocksStatus,
-        display => "kv::command::CheckSecondaryLocks {} keys@{} | {:?}", (keys.len, start_ts, ctx),
+        display => "kv::command::CheckSecondaryLocks {:?} keys@{} | {:?}", (keys, start_ts, ctx),
         content => {
             /// The keys of secondary locks.
             keys: Vec<Key>,
@@ -37,6 +41,7 @@ command! {
 impl CommandExt for CheckSecondaryLocks {
     ctx!();
     tag!(check_secondary_locks);
+    request_type!(KvCheckSecondaryLocks);
     ts!(start_ts);
     write_bytes!(keys: multiple);
     gen_lock!(keys: multiple);
@@ -51,14 +56,17 @@ enum SecondaryLockStatus {
 
 impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckSecondaryLocks {
     fn process_write(self, snapshot: S, context: WriteContext<'_, L>) -> Result<WriteResult> {
-        // It is not allowed for commit to overwrite a protected rollback. So we update max_ts
-        // to prevent this case from happening.
+        // It is not allowed for commit to overwrite a protected rollback. So we update
+        // max_ts to prevent this case from happening.
+        let region_id = self.ctx.get_region_id();
         context.concurrency_manager.update_max_ts(self.start_ts);
 
         let mut txn = MvccTxn::new(self.start_ts, context.concurrency_manager);
-        let mut reader =
-            SnapshotReader::new(self.start_ts, snapshot, !self.ctx.get_not_fill_cache());
-        let mut released_locks = ReleasedLocks::new(self.start_ts, TimeStamp::zero());
+        let mut reader = ReaderWithStats::new(
+            SnapshotReader::new_with_ctx(self.start_ts, snapshot, &self.ctx),
+            context.statistics,
+        );
+        let mut released_locks = ReleasedLocks::new();
         let mut result = SecondaryLocksStatus::Locked(Vec::new());
 
         for key in self.keys {
@@ -69,15 +77,16 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckSecondaryLocks {
                 // The lock exists, the lock information is returned.
                 Some(lock) if lock.ts == self.start_ts => {
                     if lock.lock_type == LockType::Pessimistic {
-                        released_lock = txn.unlock_key(key.clone(), true);
-                        let overlapped_write = reader.get_txn_commit_record(&key)?.unwrap_none();
+                        released_lock = txn.unlock_key(key.clone(), true, TimeStamp::zero());
+                        let overlapped_write =
+                            reader.get_txn_commit_record(&key)?.unwrap_none(region_id);
                         (SecondaryLockStatus::RolledBack, true, overlapped_write)
                     } else {
                         (SecondaryLockStatus::Locked(lock), false, None)
                     }
                 }
-                // Searches the write CF for the commit record of the lock and returns the commit timestamp
-                // (0 if the lock is not committed).
+                // Searches the write CF for the commit record of the lock and returns the commit
+                // timestamp (0 if the lock is not committed).
                 l => {
                     mismatch_lock = l;
                     match reader.get_txn_commit_record(&key)? {
@@ -89,9 +98,9 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckSecondaryLocks {
                             };
                             // We needn't write a rollback once there is a write record for it:
                             // If it's a committed record, it cannot be changed.
-                            // If it's a rollback record, it either comes from another check_secondary_lock
-                            // (thus protected) or the client stops commit actively. So we don't need
-                            // to make it protected again.
+                            // If it's a rollback record, it either comes from another
+                            // check_secondary_lock (thus protected) or the client stops commit
+                            // actively. So we don't need to make it protected again.
                             (status, false, None)
                         }
                         TxnCommitRecord::OverlappedRollback { .. } => {
@@ -135,20 +144,21 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckSecondaryLocks {
 
         let mut rows = 0;
         if let SecondaryLocksStatus::RolledBack = &result {
-            // Lock is only released when result is `RolledBack`.
-            released_locks.wake_up(context.lock_mgr);
             // One row is mutated only when a secondary lock is rolled back.
             rows = 1;
         }
-        context.statistics.add(&reader.take_statistics());
         let pr = ProcessResult::SecondaryLocksStatus { status: result };
-        let write_data = WriteData::from_modifies(txn.into_modifies());
+        let new_acquired_locks = txn.take_new_locks();
+        let mut write_data = WriteData::from_modifies(txn.into_modifies());
+        write_data.set_allowed_on_disk_almost_full();
         Ok(WriteResult {
             ctx: self.ctx,
             to_be_write: write_data,
             rows,
             pr,
-            lock_info: None,
+            lock_info: vec![],
+            released_locks,
+            new_acquired_locks,
             lock_guards: vec![],
             response_policy: ResponsePolicy::OnApplied,
         })
@@ -157,18 +167,21 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckSecondaryLocks {
 
 #[cfg(test)]
 pub mod tests {
-    use super::*;
-    use crate::storage::kv::TestEngineBuilder;
-    use crate::storage::lock_manager::DummyLockManager;
-    use crate::storage::mvcc::tests::*;
-    use crate::storage::txn::commands::WriteCommand;
-    use crate::storage::txn::tests::*;
-    use crate::storage::Engine;
     use concurrency_manager::ConcurrencyManager;
     use kvproto::kvrpcpb::Context;
+    use tikv_util::deadline::Deadline;
+
+    use super::*;
+    use crate::storage::{
+        kv::TestEngineBuilder,
+        lock_manager::MockLockManager,
+        mvcc::tests::*,
+        txn::{commands::WriteCommand, scheduler::DEFAULT_EXECUTION_DURATION_LIMIT, tests::*},
+        Engine,
+    };
 
     pub fn must_success<E: Engine>(
-        engine: &E,
+        engine: &mut E,
         key: &[u8],
         lock_ts: impl Into<TimeStamp>,
         expect_status: SecondaryLocksStatus,
@@ -181,16 +194,18 @@ pub mod tests {
             ctx: ctx.clone(),
             keys: vec![Key::from_raw(key)],
             start_ts: lock_ts,
+            deadline: Deadline::from_now(DEFAULT_EXECUTION_DURATION_LIMIT),
         };
         let result = command
             .process_write(
                 snapshot,
                 WriteContext {
-                    lock_mgr: &DummyLockManager,
+                    lock_mgr: &MockLockManager::new(),
                     concurrency_manager: cm,
                     extra_op: Default::default(),
                     statistics: &mut Default::default(),
                     async_apply_prewrite: false,
+                    raw_ext: None,
                 },
             )
             .unwrap();
@@ -204,33 +219,36 @@ pub mod tests {
 
     #[test]
     fn test_check_async_commit_secondary_locks() {
-        let engine = TestEngineBuilder::new().build().unwrap();
+        let mut engine = TestEngineBuilder::new().build().unwrap();
+        let mut engine_clone = engine.clone();
         let ctx = Context::default();
         let cm = ConcurrencyManager::new(1.into());
 
-        let check_secondary = |key, ts| {
-            let snapshot = engine.snapshot(Default::default()).unwrap();
+        let mut check_secondary = |key, ts| {
+            let snapshot = engine_clone.snapshot(Default::default()).unwrap();
             let key = Key::from_raw(key);
             let ts = TimeStamp::new(ts);
             let command = crate::storage::txn::commands::CheckSecondaryLocks {
                 ctx: Default::default(),
                 keys: vec![key],
                 start_ts: ts,
+                deadline: Deadline::from_now(DEFAULT_EXECUTION_DURATION_LIMIT),
             };
             let result = command
                 .process_write(
                     snapshot,
                     WriteContext {
-                        lock_mgr: &DummyLockManager,
+                        lock_mgr: &MockLockManager::new(),
                         concurrency_manager: cm.clone(),
                         extra_op: Default::default(),
                         statistics: &mut Default::default(),
                         async_apply_prewrite: false,
+                        raw_ext: None,
                     },
                 )
                 .unwrap();
             if !result.to_be_write.modifies.is_empty() {
-                engine.write(&ctx, result.to_be_write).unwrap();
+                engine_clone.write(&ctx, result.to_be_write).unwrap();
             }
             if let ProcessResult::SecondaryLocksStatus { status } = result.pr {
                 status
@@ -239,11 +257,11 @@ pub mod tests {
             }
         };
 
-        must_prewrite_lock(&engine, b"k1", b"key", 1);
-        must_commit(&engine, b"k1", 1, 3);
-        must_rollback(&engine, b"k1", 5, false);
-        must_prewrite_lock(&engine, b"k1", b"key", 7);
-        must_commit(&engine, b"k1", 7, 9);
+        must_prewrite_lock(&mut engine, b"k1", b"key", 1);
+        must_commit(&mut engine, b"k1", 1, 3);
+        must_rollback(&mut engine, b"k1", 5, false);
+        must_prewrite_lock(&mut engine, b"k1", b"key", 7);
+        must_commit(&mut engine, b"k1", 7, 9);
 
         // Lock CF has no lock
         //
@@ -257,20 +275,20 @@ pub mod tests {
             check_secondary(b"k1", 7),
             SecondaryLocksStatus::Committed(9.into())
         );
-        must_get_commit_ts(&engine, b"k1", 7, 9);
+        must_get_commit_ts(&mut engine, b"k1", 7, 9);
         assert_eq!(check_secondary(b"k1", 5), SecondaryLocksStatus::RolledBack);
-        must_get_rollback_ts(&engine, b"k1", 5);
+        must_get_rollback_ts(&mut engine, b"k1", 5);
         assert_eq!(
             check_secondary(b"k1", 1),
             SecondaryLocksStatus::Committed(3.into())
         );
-        must_get_commit_ts(&engine, b"k1", 1, 3);
+        must_get_commit_ts(&mut engine, b"k1", 1, 3);
         assert_eq!(check_secondary(b"k1", 6), SecondaryLocksStatus::RolledBack);
-        must_get_rollback_protected(&engine, b"k1", 6, true);
+        must_get_rollback_protected(&mut engine, b"k1", 6, true);
 
         // ----------------------------
 
-        must_acquire_pessimistic_lock(&engine, b"k1", b"key", 11, 11);
+        must_acquire_pessimistic_lock(&mut engine, b"k1", b"key", 11, 11);
 
         // Lock CF has a pessimistic lock
         //
@@ -282,11 +300,11 @@ pub mod tests {
 
         let status = check_secondary(b"k1", 11);
         assert_eq!(status, SecondaryLocksStatus::RolledBack);
-        must_get_rollback_protected(&engine, b"k1", 11, true);
+        must_get_rollback_protected(&mut engine, b"k1", 11, true);
 
         // ----------------------------
 
-        must_prewrite_lock(&engine, b"k1", b"key", 13);
+        must_prewrite_lock(&mut engine, b"k1", b"key", 13);
 
         // Lock CF has an optimistic lock
         //
@@ -301,11 +319,11 @@ pub mod tests {
             SecondaryLocksStatus::Locked(_) => {}
             res => panic!("unexpected lock status: {:?}", res),
         }
-        must_locked(&engine, b"k1", 13);
+        must_locked(&mut engine, b"k1", 13);
 
         // ----------------------------
 
-        must_commit(&engine, b"k1", 13, 15);
+        must_commit(&mut engine, b"k1", 13, 15);
 
         // Lock CF has an optimistic lock
         //
@@ -321,12 +339,12 @@ pub mod tests {
             SecondaryLocksStatus::RolledBack => {}
             res => panic!("unexpected lock status: {:?}", res),
         }
-        must_get_rollback_protected(&engine, b"k1", 14, true);
+        must_get_rollback_protected(&mut engine, b"k1", 14, true);
 
         match check_secondary(b"k1", 15) {
             SecondaryLocksStatus::RolledBack => {}
             res => panic!("unexpected lock status: {:?}", res),
         }
-        must_get_overlapped_rollback(&engine, b"k1", 15, 13, WriteType::Lock, Some(0));
+        must_get_overlapped_rollback(&mut engine, b"k1", 15, 13, WriteType::Lock, Some(0));
     }
 }

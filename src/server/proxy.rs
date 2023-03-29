@@ -8,21 +8,25 @@
 //! `tikv_receiver_addr` to check where the message should delievered to. If
 //! there is no such metadata, it will handle the message by itself.
 
-use crate::server::Config;
+use std::{
+    ffi::CString,
+    future::Future,
+    str,
+    sync::{Arc, Weak},
+    time::Duration,
+};
+
 use collections::HashMap;
 use grpcio::{CallOption, Channel, ChannelBuilder, Environment, MetadataBuilder, RpcContext};
 use kvproto::tikvpb::TikvClient;
 use security::SecurityManager;
-use std::ffi::CString;
-use std::future::Future;
-use std::str;
-use std::sync::{Arc, Weak};
-use std::time::Duration;
+
+use crate::server::Config;
 
 const FORWARD_METADATA_KEY: &str = "tikv-forwarded-host";
 
 /// Checks if the message is supposed to send to another address.
-pub fn get_target_address<'a>(ctx: &'a RpcContext) -> &'a str {
+pub fn get_target_address<'a>(ctx: &'a RpcContext<'_>) -> &'a str {
     let metadata = ctx.request_headers();
     // In most case, forwarding is unnecessary.
     if metadata.is_empty() {

@@ -1,5 +1,10 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::{
+    io::{BufRead, Read, Write},
+    path::{Path, PathBuf},
+};
+
 use byteorder::{BigEndian, ByteOrder};
 use file_system::{rename, File, OpenOptions};
 use kvproto::encryptionpb::{EncryptedContent, FileDictionary, FileInfo};
@@ -7,20 +12,17 @@ use protobuf::Message;
 use rand::{thread_rng, RngCore};
 use tikv_util::{box_err, set_panic_mark, warn};
 
-use crate::encrypted_file::{EncryptedFile, Header, Version, TMP_FILE_SUFFIX};
-use crate::master_key::{Backend, PlaintextBackend};
-use crate::metrics::*;
-use crate::Error;
-use crate::Result;
-
-use std::io::BufRead;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use crate::{
+    encrypted_file::{EncryptedFile, Header, Version, TMP_FILE_SUFFIX},
+    master_key::{Backend, PlaintextBackend},
+    metrics::*,
+    Error, Result,
+};
 
 #[derive(Debug)]
 enum LogRecord {
-    INSERT(FileInfo),
-    REMOVE,
+    Insert(FileInfo),
+    Remove,
 }
 
 /// FileDictionaryFile is used to store log style file dictionary.
@@ -43,7 +45,7 @@ pub struct FileDictionaryFile {
     enable_log: bool,
     // Determine whether compact the log.
     file_rewrite_threshold: u64,
-    // Record the number of `REMOVE` to determine whether compact the log.
+    // Record the number of `Remove` to determine whether compact the log.
     removed: u64,
     // Record size of the file.
     file_size: usize,
@@ -118,7 +120,8 @@ impl FileDictionaryFile {
         self.base.join(&self.name)
     }
 
-    /// Rewrite the log file to reduce file size and reduce the time of next recovery.
+    /// Rewrite the log file to reduce file size and reduce the time of next
+    /// recovery.
     fn rewrite(&mut self) -> Result<()> {
         let file_dict_bytes = self.file_dict.write_to_bytes()?;
         if self.enable_log {
@@ -179,10 +182,10 @@ impl FileDictionaryFile {
                             remained.consume(used_size);
                             last_record_name = file_name.clone();
                             match mode {
-                                LogRecord::INSERT(info) => {
+                                LogRecord::Insert(info) => {
                                     file_dict.files.insert(file_name, info);
                                 }
-                                LogRecord::REMOVE => {
+                                LogRecord::Remove => {
                                     let original = file_dict.files.remove(&file_name);
                                     if original.is_none() {
                                         return Err(box_err!(
@@ -221,7 +224,7 @@ impl FileDictionaryFile {
         self.file_dict.files.insert(name.to_owned(), info.clone());
         if self.enable_log {
             let file = self.append_file.as_mut().unwrap();
-            let bytes = Self::convert_record_to_bytes(name, LogRecord::INSERT(info.clone()))?;
+            let bytes = Self::convert_record_to_bytes(name, LogRecord::Insert(info.clone()))?;
 
             fail::fail_point!("file_dict_log_append_incomplete", |truncate_num| {
                 let mut bytes = bytes.clone();
@@ -251,7 +254,7 @@ impl FileDictionaryFile {
         self.file_dict.files.remove(name);
         if self.enable_log {
             let file = self.append_file.as_mut().unwrap();
-            let bytes = Self::convert_record_to_bytes(name, LogRecord::REMOVE)?;
+            let bytes = Self::convert_record_to_bytes(name, LogRecord::Remove)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
 
@@ -282,13 +285,13 @@ impl FileDictionaryFile {
 
         let mut header_buf = [0; Self::RECORD_HEADER_SIZE];
         let info_len = match record_type {
-            LogRecord::INSERT(info) => {
+            LogRecord::Insert(info) => {
                 header_buf[Self::RECORD_HEADER_SIZE - 1] = 1;
                 let info_bytes = info.write_to_bytes()?;
                 content.extend_from_slice(&info_bytes);
                 info_bytes.len() as u16
             }
-            LogRecord::REMOVE => {
+            LogRecord::Remove => {
                 header_buf[Self::RECORD_HEADER_SIZE - 1] = 2;
                 0
             }
@@ -363,11 +366,11 @@ impl FileDictionaryFile {
         // return result
         let used_size = Self::RECORD_HEADER_SIZE + name_len + info_len;
         let record = match mode {
-            2 => LogRecord::REMOVE,
+            2 => LogRecord::Remove,
             1 => {
                 let mut file_info = FileInfo::default();
                 file_info.merge_from_bytes(&remained[0..info_len])?;
-                LogRecord::INSERT(file_info)
+                LogRecord::Insert(file_info)
             }
             _ => return Err(box_err!("file corrupted! record type is unknown: {}", mode)),
         };
@@ -384,11 +387,10 @@ impl FileDictionaryFile {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::crypter::compat;
-    use crate::encrypted_file::EncryptedFile;
-    use crate::Error;
     use kvproto::encryptionpb::EncryptionMethod;
+
+    use super::*;
+    use crate::{encrypted_file::EncryptedFile, Error};
 
     fn test_file_dict_file_normal(enable_log: bool) {
         let tempdir = tempfile::tempdir().unwrap();
@@ -396,7 +398,7 @@ mod tests {
             tempdir.path(),
             "test_file_dict_file",
             enable_log,
-            2, /*file_rewrite_threshold*/
+            2, // file_rewrite_threshold
         )
         .unwrap();
         let info1 = create_file_info(1, EncryptionMethod::Aes256Ctr);
@@ -439,12 +441,12 @@ mod tests {
 
     #[test]
     fn test_file_dict_file_normal_v1() {
-        test_file_dict_file_normal(false /*enable_log*/);
+        test_file_dict_file_normal(false /* enable_log */);
     }
 
     #[test]
     fn test_file_dict_file_normal_v2() {
-        test_file_dict_file_normal(true /*enable_log*/);
+        test_file_dict_file_normal(true /* enable_log */);
     }
 
     fn test_file_dict_file_existed(enable_log: bool) {
@@ -453,7 +455,7 @@ mod tests {
             tempdir.path(),
             "test_file_dict_file",
             enable_log,
-            2, /*file_rewrite_threshold*/
+            2, // file_rewrite_threshold
         )
         .unwrap();
 
@@ -463,9 +465,9 @@ mod tests {
         let (_, file_dict) = FileDictionaryFile::open(
             tempdir.path(),
             "test_file_dict_file",
-            true,  /*enable_log*/
-            2,     /*file_rewrite_threshold*/
-            false, /*skip_rewrite*/
+            true,  // enable_log
+            2,     // file_rewrite_threshold
+            false, // skip_rewrite
         )
         .unwrap();
         assert_eq!(*file_dict.files.get("info").unwrap(), info);
@@ -473,12 +475,12 @@ mod tests {
 
     #[test]
     fn test_file_dict_file_existed_v1() {
-        test_file_dict_file_existed(false /*enable_log*/);
+        test_file_dict_file_existed(false /* enable_log */);
     }
 
     #[test]
     fn test_file_dict_file_existed_v2() {
-        test_file_dict_file_existed(true /*enable_log*/);
+        test_file_dict_file_existed(true /* enable_log */);
     }
 
     fn test_file_dict_file_not_existed(enable_log: bool) {
@@ -487,20 +489,20 @@ mod tests {
             tempdir.path(),
             "test_file_dict_file",
             enable_log,
-            2,     /*file_rewrite_threshold*/
-            false, /*skip_rewrite*/
+            2,     // file_rewrite_threshold
+            false, // skip_rewrite
         );
         assert!(matches!(ret, Err(Error::Io(_))));
     }
 
     #[test]
     fn test_file_dict_file_not_existed_v1() {
-        test_file_dict_file_not_existed(false /*enable_log*/);
+        test_file_dict_file_not_existed(false /* enable_log */);
     }
 
     #[test]
     fn test_file_dict_file_not_existed_v2() {
-        test_file_dict_file_not_existed(true /*enable_log*/);
+        test_file_dict_file_not_existed(true /* enable_log */);
     }
 
     #[test]
@@ -523,9 +525,9 @@ mod tests {
         let (_, file_dict_read) = FileDictionaryFile::open(
             tempdir.path(),
             "test_file_dict_file",
-            true,  /*enable_log*/
-            2,     /*file_rewrite_threshold*/
-            false, /*skip_rewrite*/
+            true,  // enable_log
+            2,     // file_rewrite_threshold
+            false, // skip_rewrite
         )
         .unwrap();
         assert_eq!(file_dict, file_dict_read);
@@ -543,19 +545,19 @@ mod tests {
             let mut file_dict = FileDictionaryFile::new(
                 tempdir.path(),
                 "test_file_dict_file",
-                true, /*enable_log*/
-                1000, /*file_rewrite_threshold*/
+                true, // enable_log
+                1000, // file_rewrite_threshold
             )
             .unwrap();
 
-            file_dict.insert(&"f1".to_owned(), &info1).unwrap();
-            file_dict.insert(&"f2".to_owned(), &info2).unwrap();
-            file_dict.insert(&"f3".to_owned(), &info3).unwrap();
+            file_dict.insert("f1", &info1).unwrap();
+            file_dict.insert("f2", &info2).unwrap();
+            file_dict.insert("f3", &info3).unwrap();
 
             file_dict.insert("f4", &info4).unwrap();
             file_dict.remove("f3").unwrap();
 
-            file_dict.remove(&"f2".to_owned()).unwrap();
+            file_dict.remove("f2").unwrap();
         }
         // Try open as v1 file. Should fail.
         {
@@ -570,9 +572,9 @@ mod tests {
             let (_, file_dict) = FileDictionaryFile::open(
                 tempdir.path(),
                 "test_file_dict_file",
-                true, /*enable_log*/
-                1000, /*file_rewrite_threshold*/
-                true, /*skip_rewrite*/
+                true, // enable_log
+                1000, // file_rewrite_threshold
+                true, // skip_rewrite
             )
             .unwrap();
             assert_eq!(*file_dict.files.get("f1").unwrap(), info1);
@@ -585,9 +587,9 @@ mod tests {
             let (_, file_dict) = FileDictionaryFile::open(
                 tempdir.path(),
                 "test_file_dict_file",
-                false, /*enable_log*/
-                1000,  /*file_rewrite_threshold*/
-                false, /*skip_rewrite*/
+                false, // enable_log
+                1000,  // file_rewrite_threshold
+                false, // skip_rewrite
             )
             .unwrap();
             assert_eq!(*file_dict.files.get("f1").unwrap(), info1);
@@ -598,10 +600,9 @@ mod tests {
         // Try open as v1 file. Should success.
         {
             let file_dict_file = EncryptedFile::new(tempdir.path(), "test_file_dict_file");
-            let file_bytes = file_dict_file.read(&PlaintextBackend::default());
-            assert!(file_bytes.is_ok());
+            let file_bytes = file_dict_file.read(&PlaintextBackend::default()).unwrap();
             let mut file_dict = FileDictionary::default();
-            file_dict.merge_from_bytes(&file_bytes.unwrap()).unwrap();
+            file_dict.merge_from_bytes(&file_bytes).unwrap();
             assert_eq!(*file_dict.files.get("f1").unwrap(), info1);
             assert_eq!(file_dict.files.get("f2"), None);
             assert_eq!(file_dict.files.get("f3"), None);
@@ -612,7 +613,7 @@ mod tests {
     fn create_file_info(id: u64, method: EncryptionMethod) -> FileInfo {
         FileInfo {
             key_id: id,
-            method: compat(method),
+            method,
             ..Default::default()
         }
     }
